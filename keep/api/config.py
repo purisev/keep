@@ -9,6 +9,7 @@ from keep.api.api import AUTH_TYPE
 from keep.api.bl.mapping_rules_provisioning import provision_mapping_rules_from_env
 from keep.api.core.db_on_start import migrate_db, try_create_single_tenant
 from keep.api.core.dependencies import SINGLE_TENANT_UUID
+from keep.api.core.presets_provisioning import provision_presets_from_env
 from keep.api.core.tenant_configuration import TenantConfiguration
 from keep.api.routes.dashboard import provision_dashboards
 from keep.identitymanager.identitymanagerfactory import IdentityManagerTypes
@@ -40,6 +41,11 @@ def provision_resources():
         logger.info("Provisioning mapping rules")
         provision_mapping_rules_from_env(SINGLE_TENANT_UUID)
         logger.info("Mapping rules provisioned successfully")
+        # Fork addition: upstream does not provision presets, which is what a
+        # per-team feed needs to be describable in Git.
+        logger.info("Provisioning presets")
+        provision_presets_from_env(SINGLE_TENANT_UUID)
+        logger.info("Presets provisioned successfully")
     else:
         logger.info("Provisioning resources is disabled")
 

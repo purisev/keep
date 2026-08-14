@@ -49,6 +49,12 @@ class Preset(SQLModel, table=True):
     counter_shows_firing_only: Optional[bool] = Field(default=False)
     name: str = Field(unique=True)
     options: list = Field(sa_column=Column(JSON))  # [{"label": "", "value": ""}]
+    # Provisioning fields, mirroring MappingRule.is_provisioned / provisioned_file.
+    # Reconciliation only ever deletes rows with is_provisioned=True, so a preset
+    # a human created in the UI is never removed by a config change.
+    is_provisioned: bool = Field(default=False)
+    # Uncapped (no max_length) — real GitOps mount paths regularly exceed 255 chars.
+    provisioned_file: Optional[str] = Field(default=None)
     tags: List[Tag] = Relationship(
         back_populates="presets",
         link_model=PresetTagLink,
