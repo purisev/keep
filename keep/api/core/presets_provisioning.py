@@ -237,6 +237,11 @@ def provision_presets_from_env(tenant_id: str) -> None:
         )
     desired_by_name = {preset["name"]: preset for preset in desired}
 
+    from sqlmodel import Session, select
+
+    from keep.api.core import db as core_db
+    from keep.api.models.db.preset import Preset, PresetTagLink
+
     with Session(core_db.engine) as session:
         existing = session.exec(
             select(Preset).where(Preset.tenant_id == tenant_id)

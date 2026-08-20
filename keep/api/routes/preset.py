@@ -228,8 +228,10 @@ def get_presets(
         preset_ids=allowed_preset_ids,
     )
     presets_dto = [PresetDto(**preset.to_dict()) for preset in presets]
-    # add static presets (unless allowed_preset_ids is set)
-    if not allowed_preset_ids:
+    # Add the static "feed" preset when unrestricted, or when a rule
+    # explicitly grants it (see oidc_resource_resolver._fetch_preset_records
+    # -- its sentinel id can only ever land in allowed_preset_ids that way).
+    if not allowed_preset_ids or str(STATIC_PRESETS["feed"].id) in allowed_preset_ids:
         presets_dto.append(STATIC_PRESETS["feed"])
     logger.info("Got all presets")
 

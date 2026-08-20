@@ -1,4 +1,5 @@
 import logging
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Tuple
 
@@ -19,7 +20,8 @@ from keep.api.core.cel_to_sql.sql_providers.base import CelToSqlException
 from keep.api.core.cel_to_sql.sql_providers.get_cel_to_sql_provider_for_dialect import (
     get_cel_to_sql_provider,
 )
-from keep.api.core.db import engine, enrich_incidents_with_alerts
+from keep.api.core import db as core_db
+from keep.api.core.db import enrich_incidents_with_alerts
 from keep.api.core.facets import get_facet_options, get_facets
 from keep.api.models.db.alert import (
     Alert,
@@ -29,6 +31,7 @@ from keep.api.models.db.alert import (
     LastAlertToIncident,
 )
 from keep.api.models.db.facet import FacetType
+from keep.api.models.db.incident import IncidentSeverity
 from keep.api.models.facet import FacetDto, FacetOptionDto, FacetOptionsQueryDto
 from keep.api.models.incident import IncidentSorting
 from keep.api.models.query import SortOptionsDto
@@ -59,6 +62,14 @@ incident_field_configurations = [
         map_from_pattern="severity",
         map_to="incident.severity",
         data_type=DataType.STRING,
+        # incident.severity stores IncidentSeverity's int order (1-5), not its
+        # label -- unlike alert severity, which is read out of a JSON blob as
+        # the original string. Without this, `severity == 'critical'` compiled
+        # to `incident.severity = 'critical'`, comparing an int column against
+        # a string literal that could never match.
+        enum_int_values={
+            severity.value: severity.order for severity in IncidentSeverity
+        },
     ),
     FieldMappingConfiguration(
         map_from_pattern="status",
@@ -130,6 +141,17 @@ incident_field_configurations = [
     ),
     FieldMappingConfiguration(
         map_from_pattern="affectedServices",
+        map_to="incident.affected_services",
+        data_type=DataType.ARRAY,
+    ),
+    # Alias for affectedServices. The OIDC resource-permission feature
+    # (keep/identitymanager/identity_managers/oidc/) documents `service` as
+    # the field name for scoping incident rules by affected service -- see
+    # its README and oidc_permissions.py's own module docstring -- but no
+    # such mapping actually existed, so every rule written exactly as
+    # documented (e.g. `service in ['postgres']`) matched nothing.
+    FieldMappingConfiguration(
+        map_from_pattern="service",
         map_to="incident.affected_services",
         data_type=DataType.ARRAY,
     ),
@@ -351,7 +373,12 @@ def __build_last_incidents_total_count_query(
     query = query.filter(Incident.is_candidate == is_candidate)
 
     if allowed_incident_ids:
-        query = query.filter(Incident.id.in_(allowed_incident_ids))
+        # allowed_incident_ids is list[str] (see get_user_permission_on_resource_type),
+        # but Incident.id is a native SQLAlchemy Uuid column, whose bind
+        # processor requires actual uuid.UUID instances.
+        query = query.filter(
+            Incident.id.in_([uuid.UUID(str(i)) for i in allowed_incident_ids])
+        )
 
     if is_predicted is not None:
         query = query.filter(Incident.is_predicted == is_predicted)
@@ -433,7 +460,9 @@ def __build_last_incidents_query(
     sql_query = sql_query.filter(Incident.is_candidate == is_candidate)
 
     if allowed_incident_ids:
-        sql_query = sql_query.filter(Incident.id.in_(allowed_incident_ids))
+        sql_query = sql_query.filter(
+            Incident.id.in_([uuid.UUID(str(i)) for i in allowed_incident_ids])
+        )
 
     if is_predicted is not None:
         sql_query = sql_query.filter(Incident.is_predicted == is_predicted)
@@ -494,7 +523,7 @@ def get_last_incidents_by_cel(
         Tuple[list[Incident], int]: A tuple containing a list of incidents and the total count of incidents.
     """
 
-    with Session(engine) as session:
+    with Session(core_db.engine) as session:
         try:
             total_count_query = __build_last_incidents_total_count_query(
                 tenant_id=tenant_id,
@@ -594,7 +623,9 @@ def get_incident_facets_data(
             force_fetch_has_linked_incident=force_fetch_has_linked_incident,
         )["query"]
         if allowed_incident_ids:
-            base_query = base_query.filter(Incident.id.in_(allowed_incident_ids))
+            base_query = base_query.filter(
+                Incident.id.in_([uuid.UUID(str(i)) for i in allowed_incident_ids])
+            )
         return base_query
 
     return get_facet_options(

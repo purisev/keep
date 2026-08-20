@@ -51,6 +51,7 @@ from sqlmodel import Session, select
 # Imported as a module, not `from ... import engine`: the engine is created at
 # import time and is monkeypatched by the test fixtures, so binding the name here
 # would pin the production engine.
+from keep.api.consts import STATIC_PRESETS
 from keep.api.core import db as core_db
 from keep.api.core.incidents import get_last_incidents_by_cel
 from keep.api.models.db.preset import Preset
@@ -156,7 +157,7 @@ def _fetch_preset_records(tenant_id: str, limit: int) -> list[dict]:
         )
         presets = presets[:limit]
 
-    return [
+    records = [
         {
             "id": preset.id,
             "name": preset.name,
@@ -165,6 +166,26 @@ def _fetch_preset_records(tenant_id: str, limit: int) -> list[dict]:
         }
         for preset in presets
     ]
+
+    # Keep's built-in "feed" preset (STATIC_PRESETS["feed"]) isn't a database
+    # row -- it's a fixed sentinel id, shown by keep/api/routes/preset.py only
+    # when a role has no preset restriction at all. Once a role has ANY
+    # preset rule, that sentinel can never appear in a query over real Preset
+    # rows, so a role scoped to its own presets lost the default feed with no
+    # way for an operator to grant it back. Projecting it into the same pool
+    # real presets are matched against lets a rule opt a role back in
+    # explicitly, e.g. match: {name: ["feed"]} -- an ordinary, auditable
+    # configuration choice instead of a structural dead end.
+    feed = STATIC_PRESETS["feed"]
+    records.append(
+        {
+            "id": feed.id,
+            "name": feed.name,
+            "tag": [],
+            "created_by": feed.created_by,
+        }
+    )
+    return records
 
 
 # Resource types whose rules are matched over fetched records. Incidents are

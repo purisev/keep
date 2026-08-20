@@ -23,10 +23,49 @@ import os
 import sys
 import tempfile
 
+import pytest
+
 # Running this file directly puts tests/ on sys.path, not the repo root.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 TENANT = "keep"
+
+# Captured once at collection time, before any fresh() reload. Other modules
+# (oidc_resource_resolver.py, tests/test_oidc_resource_resolver.py) bind
+# `rbac`/`oidc_permissions` names at their OWN first import -- also collection
+# time, to these same original instances. fresh() below swaps new module
+# objects into sys.modules on every call; without restoring the originals
+# afterward, any test file that runs later in the same pytest process and
+# reads through one of those stale bound references (e.g.
+# oidc_resource_resolver.get_last_incidents_by_cel's sibling
+# apply_rules/get_rules_for, or oidc_permissions.build_rule()'s internal
+# get_all_roles() call) desyncs from whatever this file's fresh() last left in
+# sys.modules, producing spurious "unknown role" errors with no relation to
+# whatever that later file is actually testing.
+_ORIGINAL_RBAC = importlib.import_module("keep.identitymanager.rbac")
+_ORIGINAL_OIDC_PERMISSIONS = importlib.import_module(
+    "keep.identitymanager.identity_managers.oidc.oidc_permissions"
+)
+
+
+@pytest.fixture(autouse=True)
+def _restore_original_modules():
+    yield
+    # Reimporting a submodule doesn't just replace the sys.modules entry --
+    # it also overwrites the PARENT PACKAGE's own attribute of the same name
+    # (e.g. keep.identitymanager.rbac as an attribute on the keep.identitymanager
+    # package object). `from keep.identitymanager import rbac`-style imports
+    # resolve through that attribute, not through sys.modules, so both have to
+    # be restored or a fresh() call from this file leaves a stale module
+    # reachable via attribute access even after sys.modules looks correct.
+    sys.modules["keep.identitymanager.rbac"] = _ORIGINAL_RBAC
+    sys.modules["keep.identitymanager"].rbac = _ORIGINAL_RBAC
+    sys.modules[
+        "keep.identitymanager.identity_managers.oidc.oidc_permissions"
+    ] = _ORIGINAL_OIDC_PERMISSIONS
+    sys.modules[
+        "keep.identitymanager.identity_managers.oidc"
+    ].oidc_permissions = _ORIGINAL_OIDC_PERMISSIONS
 
 # Roles the rules refer to must exist in the rbac registry, so every reload
 # registers them through the same KEEP_CUSTOM_ROLES path production uses.

@@ -20,7 +20,11 @@ from sqlmodel import Session
 
 from keep.api.arq_pool import get_pool
 from keep.api.bl.enrichments_bl import EnrichmentsBl
-from keep.api.consts import KEEP_ARQ_QUEUE_BASIC, fingerprints_for_poll_payload
+from keep.api.consts import (
+    KEEP_ARQ_QUEUE_BASIC,
+    STATIC_PRESETS,
+    fingerprints_for_poll_payload,
+)
 from keep.api.core.alerts import (
     get_alert_facets,
     get_alert_facets_data,
@@ -46,6 +50,8 @@ from keep.api.core.db import (
     get_session,
     is_all_alerts_resolved,
 )
+from keep.api.core.db import get_presets as get_presets_db
+from keep.api.models.db.preset import PresetDto
 from keep.api.core.dependencies import extract_generic_body, get_pusher_client
 from keep.api.core.elastic import ElasticClient
 from keep.api.core.metrics import running_tasks_by_process_gauge, running_tasks_gauge
@@ -192,6 +198,61 @@ def fetch_alert_facet_fields(
     return fields
 
 
+def _scope_query_to_allowed_presets(
+    query: QueryDto, tenant_id: str, allowed_preset_ids: list[str]
+) -> Optional[QueryDto]:
+    """
+    Narrow a client-supplied alert query to what the caller's preset
+    permission rules allow, when it's restricted at all.
+
+    query_alerts() takes a free-form CEL string straight from the client, and
+    used to hand it to query_last_alerts() unfiltered -- it never consulted
+    identity_manager.get_user_permission_on_resource_type() at all. So the
+    preset-scoping this whole permission-rule feature exists to provide
+    (see presets_provisioning.py's module docstring) constrained only which
+    presets a role could see in a list; a client could still send this
+    endpoint any CEL string directly (which is exactly what the alerts table
+    UI does with the currently-selected preset's own CEL) and get back
+    every alert in the tenant.
+
+    Returns:
+        `query` unchanged, when unrestricted or explicitly granted the
+            unfiltered "feed" preset.
+        `query` with `.cel` narrowed to the union of the allowed presets'
+            own CEL, ANDed with whatever CEL the client sent.
+        `None`, when nothing is allowed (deny-all sentinel, or every
+            allowed preset id turned out to be stale) -- the caller must
+            return an empty result without querying at all.
+    """
+    if not allowed_preset_ids:
+        return query
+
+    if str(STATIC_PRESETS["feed"].id) in allowed_preset_ids:
+        # feed's own CEL is "" (every alert); being granted it explicitly is
+        # the operator opting this role into the unfiltered view.
+        return query
+
+    presets = get_presets_db(
+        tenant_id=tenant_id, email=None, preset_ids=allowed_preset_ids
+    )
+    allowed_cels = [PresetDto(**preset.to_dict()).cel_query for preset in presets]
+
+    if not allowed_cels:
+        # Either the deny-all sentinel (matches no real preset row, same as
+        # any other id that no longer exists) or every id was stale.
+        return None
+
+    if any(cel == "" for cel in allowed_cels):
+        # An allowed preset with no filter (cel: "") means unrestricted,
+        # same as feed above -- an operator can grant this deliberately.
+        return query
+
+    # CEL's boolean operators are && / ||, not the Python "and"/"or" spelling.
+    combined_cel = " || ".join(f"({cel})" for cel in allowed_cels)
+    scoped_cel = f"({query.cel}) && ({combined_cel})" if query.cel else combined_cel
+    return query.copy(update={"cel": scoped_cel})
+
+
 @router.post(
     "/query",
     description="Get last alerts occurrence",
@@ -220,6 +281,24 @@ def query_alerts(
             "tenant_id": tenant_id,
         },
     )
+
+    identity_manager = IdentityManagerFactory.get_identity_manager(tenant_id)
+    # Note: if no limitations (allowed_preset_ids is []), then all alerts are allowed
+    allowed_preset_ids = identity_manager.get_user_permission_on_resource_type(
+        resource_type="preset",
+        authenticated_entity=authenticated_entity,
+    )
+    scoped_query = _scope_query_to_allowed_presets(
+        query, tenant_id, allowed_preset_ids
+    )
+    if scoped_query is None:
+        return {
+            "limit": query.limit,
+            "offset": query.offset,
+            "count": 0,
+            "results": [],
+        }
+    query = scoped_query
 
     try:
         db_alerts, total_count = query_last_alerts(tenant_id=tenant_id, query=query)

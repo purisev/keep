@@ -3354,10 +3354,16 @@ def get_presets(
     with Session(engine) as session:
         # v2 with RBAC and roles
         if preset_ids:
+            # preset_ids is documented (and passed by every caller, e.g.
+            # OidcIdentityManager.get_user_permission_on_resource_type) as
+            # list[str]. Preset.id is a native SQLAlchemy Uuid column, whose
+            # bind processor requires actual uuid.UUID instances -- a bare
+            # string raises AttributeError deep in the DBAPI layer instead of
+            # matching anything, so every id has to be parsed here.
             statement = (
                 select(Preset)
                 .where(Preset.tenant_id == tenant_id)
-                .where(Preset.id.in_(preset_ids))
+                .where(Preset.id.in_([uuid.UUID(str(pid)) for pid in preset_ids]))
             )
         # v1, no RBAC and roles
         else:
@@ -3962,7 +3968,9 @@ def get_last_incidents(
         )
 
         if allowed_incident_ids:
-            query = query.filter(Incident.id.in_(allowed_incident_ids))
+            query = query.filter(
+                Incident.id.in_([uuid.UUID(str(i)) for i in allowed_incident_ids])
+            )
 
         if is_predicted is not None:
             query = query.filter(Incident.is_predicted == is_predicted)
