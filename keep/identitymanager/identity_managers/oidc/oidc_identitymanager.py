@@ -41,9 +41,14 @@ class OidcIdentityManager(BaseIdentityManager):
         super().__init__(tenant_id, context_manager, **kwargs)
         self.logger.info("OIDC Identity Manager initialized")
 
+    # OIDC is already the mechanism the user authenticated through, not a
+    # provider connected via a separate wizard, so there is nothing for this
+    # flag to expose. `support_sso = True` without the underlying
+    # get_sso_providers()/get_sso_wizard_url() implementations is what made
+    # GET /settings/sso 500 for every OIDC-authenticated session.
     @property
     def support_sso(self) -> bool:
-        return True
+        return False
 
     def get_auth_verifier(self, scopes) -> OidcAuthVerifier:
         return OidcAuthVerifier(scopes)
