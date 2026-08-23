@@ -136,6 +136,55 @@ def _class_attr_name(role_name: str) -> str:
     return candidate
 
 
+COMPOSITE_ROLE_SEPARATOR = "+"
+
+
+def get_or_register_composite_role(member_roles: list[str]) -> str:
+    """
+    Register (idempotently) a composite of already-registered roles and return
+    its canonical name: the sorted member names joined with "+".
+
+    Composites exist for OIDC users whose token carries several mapped groups
+    (KEEP_OIDC_ROLE_COMPOSITION=union): the composite's scopes are the union of
+    the members' scopes, and the resource-permission lookup expands the name
+    back into its members (see oidc_permissions.get_rules_for). The separator
+    is deliberately a character ROLE_NAME_PATTERN rejects, so an
+    operator-defined role can never collide with a composite name.
+    """
+    members = sorted(set(member_roles))
+    if len(members) < 2:
+        raise ValueError("A composite role needs at least two distinct members")
+    name = COMPOSITE_ROLE_SEPARATOR.join(members)
+    if name in _ROLE_REGISTRY:
+        return name
+
+    scopes: list[str] = []
+    for member in members:
+        # Raises 403 for an unknown member; the verifier resolves members from
+        # validated mappings, so this only fires on registry drift.
+        member_class = get_role_by_role_name(member)
+        for scope in member_class.SCOPES:
+            if scope not in scopes:
+                scopes.append(scope)
+
+    attr_name = _class_attr_name(name)
+    role_class = type(
+        attr_name,
+        (Role,),
+        {
+            "SCOPES": scopes,
+            "DESCRIPTION": f"composite of {', '.join(members)}",
+            "ROLE_NAME": name,
+            "COMPOSITE_OF": tuple(members),
+            "get_name": classmethod(lambda cls: cls.ROLE_NAME),
+        },
+    )
+    globals()[attr_name] = role_class
+    _ROLE_REGISTRY[name] = role_class
+    logger.info("Registered composite role %s with scopes %s", name, scopes)
+    return name
+
+
 def register_role(role_name: str, scopes: list[str], description: str = "") -> type:
     """
     Register a custom role and expose it as a class on this module.

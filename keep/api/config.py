@@ -71,6 +71,10 @@ def on_starting(server=None):
         IdentityManagerTypes.ONELOGIN.value,
         IdentityManagerTypes.KEYCLOAK.value,
         IdentityManagerTypes.OKTA.value,
+        # The generic OIDC manager is single-tenant too: without the tenant
+        # row every provisioning insert (and the first sign-in) hits the
+        # tenant FK and the server crash-loops before serving a request.
+        IdentityManagerTypes.OIDC.value,
         "no_auth",  # backwards compatibility
         "single_tenant",  # backwards compatibility
     ]:
@@ -79,6 +83,8 @@ def on_starting(server=None):
             IdentityManagerTypes.ONELOGIN.value,
             IdentityManagerTypes.KEYCLOAK.value,
             IdentityManagerTypes.OKTA.value,
+            # Users come from the identity provider; no bootstrap DB user.
+            IdentityManagerTypes.OIDC.value,
         ]
         # for oauth2proxy, we don't want to create the default user
         try_create_single_tenant(

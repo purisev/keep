@@ -53,10 +53,35 @@ Three things are configured here:
 | `KEEP_OIDC_ROLE_MAPPINGS` | — | Inline JSON, ordered by precedence: `[{"group": "keep-admins", "role": "admin"}, ...]`. The first mapping whose group is on the token wins. |
 | `KEEP_OIDC_ROLE_MAPPINGS_FILE` | — | The same content as JSON or YAML in a file. Applied before the inline list. |
 | `KEEP_OIDC_DEFAULT_ROLE` | — | Role for a user matching no mapping. Empty means deny (403). |
+| `KEEP_OIDC_ROLE_COMPOSITION` | `first-match` | `first-match`: the first mapping whose group is on the token wins — list order is the precedence. `union`: every matching mapping contributes; two or more distinct roles become a composite (see below). |
 
 At least one of `KEEP_OIDC_ROLE_MAPPINGS`, `KEEP_OIDC_ROLE_CLAIM` or
 `KEEP_OIDC_DEFAULT_ROLE` must be set, otherwise every token would be rejected
 and the verifier refuses to start.
+
+### Role composition (`KEEP_OIDC_ROLE_COMPOSITION=union`)
+
+A user whose groups map to several roles gets a composite role assembled at
+token verification — nothing to configure per combination:
+
+* The composite's name is the sorted member names joined with `+`
+  (`team-data+team-ml`). `+` is rejected by the role-name pattern, so an
+  operator-defined role can never collide with a composite.
+* **Scopes** are the union of the members' scopes.
+* **Resource permissions** expand to the members with *unrestricted-wins*
+  semantics: if any member has no rules for a resource type, that member alone
+  would see everything, so the composite does too — belonging to two teams can
+  never grant less than belonging to one. When every member is restricted, the
+  members' rules are unioned like any other multi-rule set.
+* A member with a deny-all rule contributes nothing but does not veto the
+  others.
+* `KEEP_OIDC_ROLE_CLAIM`, when set and present, still wins as a single role;
+  `KEEP_OIDC_DEFAULT_ROLE` still applies only when no mapping matched.
+* The users list shows the composite name — it is self-describing.
+
+The default stays `first-match` because unioning silently *broadens* access
+for multi-group users; switching an existing deployment to `union` is an
+access-model decision, not a cosmetic one.
 
 ### Custom roles
 
@@ -206,12 +231,40 @@ This connector preserves that contract:
 
 ### Where rules do and do not apply
 
-Enforcement happens where Keep already asks the identity manager for permitted
-resource IDs: incident listing, incident facets, incident reports, preset
-listing and preset alerts. Alerts are not covered. Restricting incidents does
-not restrict the alerts inside them, and a user who can reach an alert route can
-still see alerts for services their incident rules exclude. Treat these rules as
-scoping the incident and preset views, not as a data firewall.
+Enforcement happens in two layers.
+
+Where Keep already asks the identity manager for permitted resource IDs:
+incident listing, incident facets, incident reports, preset listing and preset
+alerts. The id-addressed incident routes (get, update, delete, split, merge,
+alerts, workflows, assign, status, severity, comment, confirm, enrich,
+unenrich) additionally refuse with 403 any incident id outside the caller's
+resolved scope — a restricted role can no longer read or mutate an incident
+by knowing its id.
+
+And on the alert routes, which never consulted the identity manager at all: a
+role restricted on **presets** is also restricted to the union of its allowed
+presets' CEL on every alert-returning or alert-addressed route — the alert
+query and its facets (including per-facet queries, which are parenthesized so
+a top-level `||` cannot escape the scope), the plain alert list, search,
+fetching by fingerprint batch, and the fingerprint-addressed routes (history,
+audit, assign, enrich, unenrich, delete), which return 403 for an alert
+outside the scope — an unknown fingerprint included, since it cannot be shown
+to be in scope and the enrichment routes would otherwise create state for it.
+Error alerts (`/alerts/event/error`) and the per-provider quality metrics are
+tenant-wide data no preset CEL can classify, so a restricted role gets none of
+them. Where the route goes through the CEL-to-SQL layer the scope is ANDed
+into the query; elsewhere it is applied in memory with the same RulesEngine
+CEL evaluation presets themselves use, so an alert is visible through a side
+route exactly when it shows up in an allowed preset.
+
+Restricting **incidents** does not restrict the alerts inside them — alert
+visibility follows preset rules, incident visibility follows incident rules.
+Give a team both kinds of rule.
+
+The websocket channel only carries "poll" signals (fingerprint lists and
+preset names, capped), never alert payloads; clients re-fetch through the
+scoped query route. Fingerprints and preset names are visible to every
+authenticated member of the tenant.
 
 A role restricted on presets also loses Keep's built-in static presets (the
 `feed` preset), because the preset route only adds them when the role is

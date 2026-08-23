@@ -39,7 +39,10 @@ from fastapi import HTTPException
 from keep.api.core.dependencies import SINGLE_TENANT_UUID
 from keep.identitymanager.authenticatedentity import AuthenticatedEntity
 from keep.identitymanager.authverifierbase import AuthVerifierBase
-from keep.identitymanager.rbac import get_role_by_role_name
+from keep.identitymanager.rbac import (
+    get_or_register_composite_role,
+    get_role_by_role_name,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -168,6 +171,21 @@ class OidcAuthVerifier(AuthVerifierBase):
         self.role_claim = os.environ.get("KEEP_OIDC_ROLE_CLAIM", "").strip()
         self.default_role = os.environ.get("KEEP_OIDC_DEFAULT_ROLE", "").strip()
         self.role_mappings = _load_role_mappings()
+        # "first-match" (default): the first mapping whose group is on the
+        # token wins — ordering is the precedence. "union": every matching
+        # mapping contributes, and a token matching several roles gets a
+        # composite whose scopes and resource permissions are the union of
+        # the members' (a user in two teams sees both feeds natively).
+        self.role_composition = (
+            os.environ.get("KEEP_OIDC_ROLE_COMPOSITION", "first-match")
+            .strip()
+            .lower()
+        )
+        if self.role_composition not in ("first-match", "union"):
+            raise OidcConfigurationError(
+                "KEEP_OIDC_ROLE_COMPOSITION must be 'first-match' or 'union', "
+                f"got {self.role_composition!r}"
+            )
 
         jwks_url = os.environ.get("KEEP_OIDC_JWKS_URL", "").strip()
         if not jwks_url:
@@ -208,12 +226,24 @@ class OidcAuthVerifier(AuthVerifierBase):
             if role_name:
                 return str(role_name)
 
-        # 2. Ordered group mappings; first match wins.
+        # 2. Ordered group mappings. In first-match mode the order is the
+        # precedence; in union mode every match contributes and two or more
+        # distinct roles become a composite (scopes and resource permissions
+        # union — see rbac.get_or_register_composite_role and
+        # oidc_permissions.get_rules_for).
         groups = _as_list(_claim(payload, self.groups_claim))
         self.logger.debug("OIDC groups on token: %s", groups)
+        matched: list[str] = []
         for group, role_name in self.role_mappings:
             if group in groups:
-                return role_name
+                if self.role_composition == "first-match":
+                    return role_name
+                if role_name not in matched:
+                    matched.append(role_name)
+        if len(matched) == 1:
+            return matched[0]
+        if matched:
+            return get_or_register_composite_role(matched)
 
         # 3. Configured fallback, if any.
         if self.default_role:

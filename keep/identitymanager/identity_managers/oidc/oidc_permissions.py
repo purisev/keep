@@ -70,7 +70,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 import yaml
 
-from keep.identitymanager.rbac import get_all_roles
+from keep.identitymanager.rbac import COMPOSITE_ROLE_SEPARATOR, get_all_roles
 
 logger = logging.getLogger(__name__)
 
@@ -397,7 +397,25 @@ def register_rule(rule: PermissionRule) -> None:
 
 
 def get_rules_for(role: str, resource_type: str) -> list[PermissionRule]:
-    """Rules restricting `role` on `resource_type`; empty means unrestricted."""
+    """
+    Rules restricting `role` on `resource_type`; empty means unrestricted.
+
+    A composite role ("team-a+team-b", produced by the verifier in
+    KEEP_OIDC_ROLE_COMPOSITION=union mode) expands to its members with
+    unrestricted-wins semantics: if ANY member has no rules for this resource
+    type, that member alone would see everything, so the composite must too —
+    returning the other members' rules instead would make belonging to two
+    teams grant LESS than belonging to one. When every member is restricted,
+    the members' rules concatenate and the resolver ORs them as usual.
+    """
+    if COMPOSITE_ROLE_SEPARATOR in role:
+        combined: list[PermissionRule] = []
+        for member in role.split(COMPOSITE_ROLE_SEPARATOR):
+            member_rules = _RULE_REGISTRY.get((member, resource_type))
+            if not member_rules:
+                return []
+            combined.extend(member_rules)
+        return combined
     return list(_RULE_REGISTRY.get((role, resource_type), ()))
 
 
