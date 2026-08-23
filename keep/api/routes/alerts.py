@@ -83,7 +83,7 @@ from keep.identitymanager.authenticatedentity import AuthenticatedEntity
 from keep.identitymanager.identitymanagerfactory import IdentityManagerFactory
 from keep.providers.providers_factory import ProvidersFactory
 from keep.rulesengine.rulesengine import RulesEngine
-from keep.searchengine.searchengine import SearchEngine
+from keep.searchengine.searchengine import SearchEngine, SearchMode
 from keep.workflowmanager.workflowmanager import WorkflowManager
 
 router = APIRouter()
@@ -445,13 +445,20 @@ def get_all_alerts(
             "tenant_id": tenant_id,
         },
     )
-    db_alerts = get_last_alerts(tenant_id=tenant_id, limit=limit)
+    scope_cel = _allowed_alerts_cel(tenant_id, authenticated_entity)
+    if scope_cel is _NOTHING_ALLOWED:
+        return []
+    if scope_cel is None:
+        db_alerts = get_last_alerts(tenant_id=tenant_id, limit=limit)
+    else:
+        # Scope in SQL, not by filtering the page get_last_alerts() returned:
+        # that applies `limit` first, so a restricted caller would get fewer
+        # than `limit` alerts (often none) while matching alerts sat just
+        # outside the page. Both paths order by timestamp descending.
+        db_alerts, _ = query_last_alerts(
+            tenant_id=tenant_id, query=QueryDto(cel=scope_cel, limit=limit)
+        )
     enriched_alerts_dto = convert_db_alerts_to_dto_alerts(db_alerts)
-    enriched_alerts_dto = _filter_alerts_to_scope(
-        enriched_alerts_dto,
-        tenant_id,
-        _allowed_alerts_cel(tenant_id, authenticated_entity),
-    )
     logger.info(
         "Fetched alerts from DB",
         extra={
@@ -1518,14 +1525,29 @@ async def search_alerts(
             extra={"tenant_id": tenant_id},
         )
         search_engine = SearchEngine(tenant_id)
-        filtered_alerts = search_engine.search_alerts(search_request.query)
-        # In-memory rather than by rewriting the search query: the elastic
-        # search mode takes SQL, where the scope CEL cannot be ANDed in.
-        filtered_alerts = _filter_alerts_to_scope(
-            filtered_alerts,
-            tenant_id,
-            _allowed_alerts_cel(tenant_id, authenticated_entity),
-        )
+        scope_cel = _allowed_alerts_cel(tenant_id, authenticated_entity)
+        if scope_cel is _NOTHING_ALLOWED:
+            return []
+        query = search_request.query
+        scope_applied_in_query = False
+        if scope_cel is not None and search_engine.search_mode == SearchMode.INTERNAL:
+            # The internal mode runs the query through query_last_alerts, which
+            # applies `limit` in SQL. Filtering its result afterwards would cut
+            # the page down instead of scoping what fills it, so AND the scope
+            # into the CEL and let the limit apply to alerts already in scope.
+            scoped_cel = (
+                f"({query.cel_query}) && ({scope_cel})"
+                if query.cel_query
+                else scope_cel
+            )
+            query = query.copy(update={"cel_query": scoped_cel})
+            scope_applied_in_query = True
+        filtered_alerts = search_engine.search_alerts(query)
+        if not scope_applied_in_query:
+            # Elastic mode takes SQL, where the scope CEL cannot be ANDed in.
+            filtered_alerts = _filter_alerts_to_scope(
+                filtered_alerts, tenant_id, scope_cel
+            )
         logger.info(
             "Searched alerts",
             extra={"tenant_id": tenant_id},

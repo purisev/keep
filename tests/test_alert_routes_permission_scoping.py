@@ -100,8 +100,12 @@ def _make_preset(db_session, name: str, cel: str) -> Preset:
     return preset
 
 
-def _make_alert(db_session, fingerprint: str, source: str, status: str) -> None:
+def _make_alert(
+    db_session, fingerprint: str, source: str, status: str, timestamp=None
+) -> None:
     now = datetime.datetime.now(tz=datetime.timezone.utc)
+    # Alert.timestamp is truncated to whole milliseconds, so rapid inserts can
+    # tie. Pass it explicitly wherever a test depends on the ordering.
     alert = Alert(
         tenant_id=SINGLE_TENANT_UUID,
         provider_type=source,
@@ -115,6 +119,7 @@ def _make_alert(db_session, fingerprint: str, source: str, status: str) -> None:
             "status": status,
             "lastReceived": now.isoformat(),
         },
+        **({"timestamp": timestamp} if timestamp is not None else {}),
     )
     db_session.add(alert)
     db_session.commit()
@@ -155,6 +160,61 @@ def test_get_all_alerts_unrestricted_role_sees_everything(
 ):
     result = get_all_alerts(authenticated_entity=_entity(role="admin"))
     assert {a.fingerprint for a in result} == {"sentry-alert", "grafana-alert"}
+
+
+@pytest.fixture
+def buried_in_scope_alert(monkeypatch, db_session, dba_role):
+    """One in-scope sentry alert, then three newer out-of-scope grafana ones.
+    A limit of 2 covers only the grafana alerts."""
+    _make_preset(db_session, "dba-sentry", 'source == "sentry"')
+    _install_rule(
+        monkeypatch,
+        {"role": ROLE, "resource_type": "preset", "match": {"name": ["dba-*"]}},
+    )
+    base = datetime.datetime.utcnow().replace(microsecond=0)
+    _make_alert(db_session, "sentry-alert", "sentry", "firing", timestamp=base)
+    for i in range(1, 4):
+        _make_alert(
+            db_session,
+            f"grafana-alert-{i}",
+            "grafana",
+            "firing",
+            timestamp=base + datetime.timedelta(seconds=i),
+        )
+
+
+def test_get_all_alerts_limit_applies_after_scoping(buried_in_scope_alert):
+    """The scope narrows what fills the page rather than cutting the page
+    down. Filtering the result of get_last_alerts(limit=2) returned nothing:
+    the two newest alerts are both out of scope, while the sentry alert that
+    matched sat just past the limit."""
+    result = get_all_alerts(authenticated_entity=_entity(), limit=2)
+    assert [a.fingerprint for a in result] == ["sentry-alert"]
+
+
+def test_search_limit_applies_after_scoping(buried_in_scope_alert):
+    """Same for the internal search mode, which runs the query through
+    query_last_alerts and applies the limit in SQL."""
+    request = SearchAlertsRequest(
+        query=PresetSearchQuery(
+            cel_query='status == "firing"', sql_query={}, limit=2
+        ),
+        timeframe=0,
+    )
+    result = asyncio.run(
+        search_alerts(search_request=request, authenticated_entity=_entity())
+    )
+    assert [a.fingerprint for a in result] == ["sentry-alert"]
+
+
+def test_get_all_alerts_limit_is_untouched_for_unrestricted_roles(
+    buried_in_scope_alert,
+):
+    result = get_all_alerts(authenticated_entity=_entity(role="admin"), limit=2)
+    assert [a.fingerprint for a in result] == [
+        "grafana-alert-3",
+        "grafana-alert-2",
+    ]
 
 
 def test_batch_by_fingerprints_is_scoped(sentry_scoped):
