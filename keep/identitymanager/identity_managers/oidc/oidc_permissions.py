@@ -392,8 +392,21 @@ def apply_rules(
 _RULE_REGISTRY: dict[tuple[str, str], list[PermissionRule]] = {}
 
 
+# Bumped on every registration so the resolver's cache can tell that the rule
+# set it resolved against is no longer the current one. In production this only
+# moves during _load_rules() at import, but the cache must not depend on that
+# staying true -- a stale allowed-ID list is an authorization decision.
+_RULES_VERSION = 0
+
+
 def register_rule(rule: PermissionRule) -> None:
+    global _RULES_VERSION
     _RULE_REGISTRY.setdefault((rule.role, rule.resource_type), []).append(rule)
+    _RULES_VERSION += 1
+
+
+def rules_version() -> int:
+    return _RULES_VERSION
 
 
 def get_rules_for(role: str, resource_type: str) -> list[PermissionRule]:

@@ -197,7 +197,19 @@ class OidcAuthVerifier(AuthVerifierBase):
         self.jwks_url = jwks_url
 
         if jwks_url not in _JWKS_CLIENT_CACHE:
-            _JWKS_CLIENT_CACHE[jwks_url] = jwt.PyJWKClient(jwks_url)
+            # cache_keys=True matters more than it looks. The default
+            # (cache_keys=False, cache_jwk_set=True) caches only the raw JWKS
+            # JSON, so get_jwk_set() runs PyJWKSet.from_dict() on every call and
+            # reconstructs the RSA key objects for every key in the set -- on
+            # every request, since the UI polls. With it on, get_signing_key(kid)
+            # is wrapped in lru_cache(maxsize=max_cached_keys) and returns an
+            # already-parsed PyJWK.
+            #
+            # The trade-off: that cache outlives key rotation, so a revoked kid
+            # keeps being served until it is evicted (16 entries). Harmless --
+            # the signature is still verified against it, and a token signed by
+            # a rotated-out key fails as it should.
+            _JWKS_CLIENT_CACHE[jwks_url] = jwt.PyJWKClient(jwks_url, cache_keys=True)
         self.jwks_client = _JWKS_CLIENT_CACHE[jwks_url]
 
         if not self.role_mappings and not self.role_claim and not self.default_role:
@@ -254,6 +266,10 @@ class OidcAuthVerifier(AuthVerifierBase):
             status_code=403, detail="No Keep role mapped for this user's groups"
         )
 
+    # Deliberately not cached, unlike the resource-permission resolution in
+    # oidc_permission_cache.py. Caching token -> AuthenticatedEntity would save
+    # one RSA verification, while a cache entry outliving the token's `exp`
+    # would keep an expired token working for the rest of the TTL. Wrong trade.
     def _verify_bearer_token(self, token: str) -> AuthenticatedEntity:
         if not token:
             raise HTTPException(status_code=401, detail="No token provided")

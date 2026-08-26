@@ -41,6 +41,11 @@ The cap still exists because the upstream call sites take a list of IDs, so the
 allowed set has to be enumerated. Truncation *narrows* what a restricted role
 sees -- the safe direction -- but it is still wrong, so hitting it is logged as
 an error rather than a warning.
+
+What is left is paid once per (tenant, role, resource type) per TTL rather than
+once per request, because the UI polls these routes every few seconds and the
+answer does not vary per request. See oidc_permission_cache.py for the TTL and
+what it does and does not guarantee.
 """
 
 import logging
@@ -55,12 +60,16 @@ from keep.api.consts import STATIC_PRESETS
 from keep.api.core import db as core_db
 from keep.api.core.incidents import get_last_incidents_by_cel
 from keep.api.models.db.preset import Preset
+from keep.identitymanager.identity_managers.oidc.oidc_permission_cache import (
+    get_or_compute,
+)
 from keep.identitymanager.identity_managers.oidc.oidc_permissions import (
     DENY_ALL_SENTINEL_ID,
     RESOURCE_TYPE_INCIDENT,
     RESOURCE_TYPE_PRESET,
     apply_rules,
     get_rules_for,
+    rules_version,
 )
 
 logger = logging.getLogger(__name__)
@@ -218,26 +227,34 @@ def resolve_allowed_resource_ids(
 
     rules = get_rules_for(role, resource_type)
     if not rules:
+        # Unrestricted, and free already: a dict lookup, no query. Returning
+        # before the cache keeps [] -- "no limitations" -- out of it entirely,
+        # so an unrestricted role can never be served from a stale entry.
         return []
 
     limit = _max_scan()
 
-    if resource_type == RESOURCE_TYPE_INCIDENT:
-        allowed = _resolve_incident_ids(tenant_id, rules, limit)
-    else:
+    def _resolve() -> list[str]:
+        if resource_type == RESOURCE_TYPE_INCIDENT:
+            return _resolve_incident_ids(tenant_id, rules, limit)
         fetch = _FETCHERS.get(resource_type)
         if fetch is None:
             # get_rules_for() only returns rules for supported resource types, so
             # this is unreachable unless SUPPORTED_RESOURCE_TYPES, _FETCHERS and
             # the CEL branch above drift apart.
             raise ValueError(f"No resolver for resource type {resource_type!r}")
-        allowed = apply_rules(rules, fetch(tenant_id, limit))
+        return apply_rules(rules, fetch(tenant_id, limit))
+
+    allowed, cached = get_or_compute(
+        (tenant_id, role, resource_type), _resolve, version=rules_version()
+    )
     logger.debug(
-        "Resolved %s allowed %s ids for role %s (tenant %s) from %s rules",
+        "Resolved %s allowed %s ids for role %s (tenant %s) from %s rules (cached=%s)",
         len(allowed),
         resource_type,
         role,
         tenant_id,
         len(rules),
+        cached,
     )
     return allowed

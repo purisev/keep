@@ -29,6 +29,7 @@ Three things are configured here:
 | `oidc_authverifier.py` | Validates the bearer token and resolves a Keep role from claims |
 | `oidc_identitymanager.py` | The identity manager: users, roles, resource permissions |
 | `oidc_permissions.py` | Resource permission rules: config, validation, matching |
+| `oidc_permission_cache.py` | Process-local TTL cache for resolved allowed-ID sets |
 | `oidc_resource_resolver.py` | Resolves rules to concrete resource IDs against the database |
 
 ## Environment variables
@@ -102,6 +103,7 @@ where the resource may be `*`. The built-in roles `admin`, `noc`, `webhook` and
 | `KEEP_RESOURCE_PERMISSIONS_FILE` | — | Path to a YAML or JSON file with the rules. |
 | `KEEP_RESOURCE_PERMISSIONS` | — | The same content, inline JSON. Applied after the file. |
 | `KEEP_RESOURCE_PERMISSIONS_MAX_SCAN` | `10000` | Upper bound on rows **returned** per rule. For incidents this bounds matched rows (the filtering happens in SQL); for presets it bounds fetched rows. Hitting it is logged as an error, and it hides data rather than exposing it. |
+| `KEEP_RESOURCE_PERMISSIONS_CACHE_TTL` | `15` | Seconds a resolved allowed-ID set is reused. `0` disables the cache. See [Caching](#caching). |
 
 ## Resource permission rules
 
@@ -357,6 +359,42 @@ the allowed set has to be enumerated rather than expressed as a predicate. If it
 is reached, the rows beyond it are hidden from restricted roles and an error is
 logged — that errs towards showing too little rather than too much, but it is
 still wrong, so raise the cap or narrow the rule.
+
+## Caching
+
+Resolution runs on every request to a protected route, and the UI polls: the
+alerts table and the incident list refetch every ~6 seconds, the preset counters
+every 5. The answer depends on the tenant, the role and the resource type and on
+nothing that varies per request, so it is cached under exactly that key — every
+user holding the same role shares one entry.
+
+`KEEP_RESOURCE_PERMISSIONS_CACHE_TTL` (default 15 s) bounds how stale that entry
+may be. It is deliberately longer than the UI's poll interval: a TTL below ~6 s
+would miss on nearly every poll from a single tab and save nothing.
+
+**The TTL is the only guarantee.** The cache lives in the worker process, and
+the API runs four of them, so:
+
+* a new incident becomes visible to a restricted role within the TTL, not
+  immediately — incidents are created by the alert pipeline, in ARQ workers that
+  share nothing with the API workers;
+* creating, updating or deleting a preset drops the cached preset entry, but
+  only in the worker that served the write. The other workers wait out the TTL.
+
+Set the TTL to `0` if a deployment cannot accept that; resolution then runs per
+request as before.
+
+Two things are deliberately **not** cached:
+
+* the token → `AuthenticatedEntity` validation, because an entry outliving the
+  token's `exp` would keep an expired token working;
+* a failed resolution. The contract is fail-open — an empty list means
+  "unrestricted" — so a cached database error would grant access to everything.
+  Errors propagate and nothing is stored.
+
+Signing keys are cached separately, by PyJWT itself: the verifier constructs
+`PyJWKClient(..., cache_keys=True)` so the JWKS keys are parsed once rather than
+rebuilt from JSON on every request.
 
 ## Tests
 

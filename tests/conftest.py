@@ -90,6 +90,21 @@ def mocked_context(ctx_store) -> None:
         yield context
 
 
+@pytest.fixture(autouse=True)
+def clear_oidc_permission_cache() -> None:
+    """
+    The resource-permission cache is process-global and keyed by (tenant, role,
+    resource type), none of which changes between tests. Several permission test
+    modules install rules by mutating oidc_permissions._RULE_REGISTRY in place,
+    so without this a test would be served the previous test's resolution.
+    """
+    from keep.identitymanager.identity_managers.oidc import oidc_permission_cache
+
+    oidc_permission_cache.clear()
+    yield
+    oidc_permission_cache.clear()
+
+
 @pytest.fixture
 def context_manager():
     os.environ["STORAGE_MANAGER_DIRECTORY"] = "/tmp/storage-manager"
