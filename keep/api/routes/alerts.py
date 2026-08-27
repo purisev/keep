@@ -20,7 +20,11 @@ from sqlmodel import Session
 
 from keep.api.arq_pool import get_pool
 from keep.api.bl.enrichments_bl import EnrichmentsBl
-from keep.api.consts import KEEP_ARQ_QUEUE_BASIC, fingerprints_for_poll_payload
+from keep.api.consts import (
+    KEEP_ARQ_QUEUE_BASIC,
+    STATIC_PRESETS,
+    fingerprints_for_poll_payload,
+)
 from keep.api.core.alerts import (
     get_alert_facets,
     get_alert_facets_data,
@@ -46,6 +50,8 @@ from keep.api.core.db import (
     get_session,
     is_all_alerts_resolved,
 )
+from keep.api.core.db import get_presets as get_presets_db
+from keep.api.models.db.preset import PresetDto
 from keep.api.core.dependencies import extract_generic_body, get_pusher_client
 from keep.api.core.elastic import ElasticClient
 from keep.api.core.metrics import running_tasks_by_process_gauge, running_tasks_gauge
@@ -76,7 +82,8 @@ from keep.api.utils.time_stamp_helpers import get_time_stamp_filter
 from keep.identitymanager.authenticatedentity import AuthenticatedEntity
 from keep.identitymanager.identitymanagerfactory import IdentityManagerFactory
 from keep.providers.providers_factory import ProvidersFactory
-from keep.searchengine.searchengine import SearchEngine
+from keep.rulesengine.rulesengine import RulesEngine
+from keep.searchengine.searchengine import SearchEngine, SearchMode
 from keep.workflowmanager.workflowmanager import WorkflowManager
 
 router = APIRouter()
@@ -109,6 +116,25 @@ def fetch_alert_facet_options(
             "tenant_id": tenant_id,
         },
     )
+
+    scope_cel = _allowed_alerts_cel(tenant_id, authenticated_entity)
+    if scope_cel is _NOTHING_ALLOWED:
+        return {facet_id: [] for facet_id in (facet_options_query.facet_queries or {})}
+    if scope_cel is not None:
+        # The facets query builder joins the base cel and each per-facet cel
+        # with a bare " && ", and && binds tighter than || in CEL -- so a
+        # client-supplied facet query with a top-level || would escape the
+        # scope. Parenthesizing every part keeps the scope conjunctive.
+        facet_options_query.cel = (
+            f"({facet_options_query.cel}) && ({scope_cel})"
+            if facet_options_query.cel
+            else scope_cel
+        )
+        if facet_options_query.facet_queries:
+            facet_options_query.facet_queries = {
+                facet_id: f"({facet_cel})" if facet_cel else facet_cel
+                for facet_id, facet_cel in facet_options_query.facet_queries.items()
+            }
 
     try:
         facet_options = get_alert_facets_data(
@@ -192,6 +218,148 @@ def fetch_alert_facet_fields(
     return fields
 
 
+# Sentinel: the caller's permission rules resolved to no preset at all, so no
+# alert may be shown. Distinct from None ("unrestricted") and from "" (which
+# both the CEL-to-SQL layer and the RulesEngine treat as "matches everything").
+_NOTHING_ALLOWED = object()
+
+
+def _allowed_alerts_cel(tenant_id: str, authenticated_entity: AuthenticatedEntity):
+    """
+    The alert-visibility scope of the caller, derived from its preset
+    permission rules.
+
+    Alert routes take free-form CEL strings and fingerprints straight from
+    the client and used to hand them to the query layer unfiltered -- they
+    never consulted identity_manager.get_user_permission_on_resource_type()
+    at all. So the preset-scoping this whole permission-rule feature exists
+    to provide (see presets_provisioning.py's module docstring) constrained
+    only which presets a role could see in a list; a client could still ask
+    any alert endpoint directly and get back every alert in the tenant.
+    Every alert-returning route therefore resolves this scope and applies it,
+    either in SQL (ANDing the CEL) or in memory (RulesEngine.filter_alerts).
+
+    Returns:
+        None, when unrestricted: no rules for the role, the unfiltered
+            "feed" preset granted explicitly, or an allowed preset whose own
+            CEL is "" (no filter).
+        A non-empty CEL string: the union (` || `) of the allowed presets'
+            own CEL. Alerts matching it are visible, others are not.
+        `_NOTHING_ALLOWED`, when the rules allow no preset (deny-all
+            sentinel, or every allowed preset id turned out to be stale) --
+            the caller must show nothing.
+    """
+    identity_manager = IdentityManagerFactory.get_identity_manager(tenant_id)
+    # Note: if no limitations (allowed_preset_ids is []), then all alerts are allowed
+    allowed_preset_ids = identity_manager.get_user_permission_on_resource_type(
+        resource_type="preset",
+        authenticated_entity=authenticated_entity,
+    )
+    if not allowed_preset_ids:
+        return None
+
+    if str(STATIC_PRESETS["feed"].id) in allowed_preset_ids:
+        # feed's own CEL is "" (every alert); being granted it explicitly is
+        # the operator opting this role into the unfiltered view.
+        return None
+
+    presets = get_presets_db(
+        tenant_id=tenant_id, email=None, preset_ids=allowed_preset_ids
+    )
+    allowed_cels = [PresetDto(**preset.to_dict()).cel_query for preset in presets]
+
+    if not allowed_cels:
+        # Either the deny-all sentinel (matches no real preset row, same as
+        # any other id that no longer exists) or every id was stale.
+        return _NOTHING_ALLOWED
+
+    if any(cel == "" for cel in allowed_cels):
+        # An allowed preset with no filter (cel: "") means unrestricted,
+        # same as feed above -- an operator can grant this deliberately.
+        return None
+
+    # CEL's boolean operators are && / ||, not the Python "and"/"or" spelling.
+    return " || ".join(f"({cel})" for cel in allowed_cels)
+
+
+def _scope_query_to_allowed_presets(
+    query: QueryDto, tenant_id: str, authenticated_entity: AuthenticatedEntity
+) -> Optional[QueryDto]:
+    """
+    Narrow a client-supplied alert query to the caller's scope (see
+    _allowed_alerts_cel). Returns None when nothing is allowed -- the caller
+    must return an empty result without querying at all.
+    """
+    scope_cel = _allowed_alerts_cel(tenant_id, authenticated_entity)
+    if scope_cel is None:
+        return query
+    if scope_cel is _NOTHING_ALLOWED:
+        return None
+    scoped_cel = f"({query.cel}) && ({scope_cel})" if query.cel else scope_cel
+    return query.copy(update={"cel": scoped_cel})
+
+
+def _filter_alerts_to_scope(
+    alerts: list[AlertDto], tenant_id: str, scope_cel
+) -> list[AlertDto]:
+    """
+    Apply an already-resolved scope (from _allowed_alerts_cel) to alerts
+    fetched outside the CEL-to-SQL query path. Uses the same RulesEngine CEL
+    evaluation that presets themselves use, so an alert is visible here
+    exactly when it shows up in an allowed preset.
+    """
+    if scope_cel is None:
+        return alerts
+    if scope_cel is _NOTHING_ALLOWED:
+        return []
+    rules_engine = RulesEngine(tenant_id=tenant_id)
+    return rules_engine.filter_alerts(alerts, scope_cel)
+
+
+def _ensure_fingerprints_allowed(
+    tenant_id: str,
+    authenticated_entity: AuthenticatedEntity,
+    fingerprints: list[str],
+) -> None:
+    """
+    Raise 403 unless every fingerprint resolves to an alert inside the
+    caller's scope. Used by the fingerprint-addressed routes (history, audit,
+    assign, enrich), which would otherwise accept any fingerprint verbatim.
+
+    A fingerprint that resolves to no alert at all is also refused for a
+    restricted caller: it cannot be shown to be in scope, and enrichment
+    routes would happily create state for it.
+    """
+    scope_cel = _allowed_alerts_cel(tenant_id, authenticated_entity)
+    if scope_cel is None:
+        return
+    if scope_cel is _NOTHING_ALLOWED:
+        raise HTTPException(
+            status_code=403, detail="Not authorized to access these alerts"
+        )
+    last_alerts = get_last_alerts_by_fingerprints(tenant_id, fingerprints)
+    alert_ids = [last_alert.alert_id for last_alert in last_alerts]
+    db_alerts = get_alerts_by_ids(tenant_id, alert_ids) if alert_ids else []
+    alerts_dto = convert_db_alerts_to_dto_alerts(db_alerts)
+    allowed_fingerprints = {
+        alert.fingerprint
+        for alert in _filter_alerts_to_scope(alerts_dto, tenant_id, scope_cel)
+    }
+    denied = [f for f in fingerprints if f not in allowed_fingerprints]
+    if denied:
+        logger.warning(
+            "Denied access to alerts outside the caller's permission scope",
+            extra={
+                "tenant_id": tenant_id,
+                "role": authenticated_entity.role,
+                "denied_fingerprints_count": len(denied),
+            },
+        )
+        raise HTTPException(
+            status_code=403, detail="Not authorized to access these alerts"
+        )
+
+
 @router.post(
     "/query",
     description="Get last alerts occurrence",
@@ -220,6 +388,16 @@ def query_alerts(
             "tenant_id": tenant_id,
         },
     )
+
+    scoped_query = _scope_query_to_allowed_presets(query, tenant_id, authenticated_entity)
+    if scoped_query is None:
+        return {
+            "limit": query.limit,
+            "offset": query.offset,
+            "count": 0,
+            "results": [],
+        }
+    query = scoped_query
 
     try:
         db_alerts, total_count = query_last_alerts(tenant_id=tenant_id, query=query)
@@ -267,7 +445,19 @@ def get_all_alerts(
             "tenant_id": tenant_id,
         },
     )
-    db_alerts = get_last_alerts(tenant_id=tenant_id, limit=limit)
+    scope_cel = _allowed_alerts_cel(tenant_id, authenticated_entity)
+    if scope_cel is _NOTHING_ALLOWED:
+        return []
+    if scope_cel is None:
+        db_alerts = get_last_alerts(tenant_id=tenant_id, limit=limit)
+    else:
+        # Scope in SQL, not by filtering the page get_last_alerts() returned:
+        # that applies `limit` first, so a restricted caller would get fewer
+        # than `limit` alerts (often none) while matching alerts sat just
+        # outside the page. Both paths order by timestamp descending.
+        db_alerts, _ = query_last_alerts(
+            tenant_id=tenant_id, query=QueryDto(cel=scope_cel, limit=limit)
+        )
     enriched_alerts_dto = convert_db_alerts_to_dto_alerts(db_alerts)
     logger.info(
         "Fetched alerts from DB",
@@ -297,7 +487,12 @@ def get_alerts_by_fingerprints_batch(
 
     db_alerts = get_alerts_by_ids(tenant_id, alert_ids)
     db_alerts = enrich_alerts_with_incidents(tenant_id, db_alerts)
-    return convert_db_alerts_to_dto_alerts(db_alerts, with_incidents=True)
+    alerts_dto = convert_db_alerts_to_dto_alerts(db_alerts, with_incidents=True)
+    return _filter_alerts_to_scope(
+        alerts_dto,
+        tenant_id,
+        _allowed_alerts_cel(tenant_id, authenticated_entity),
+    )
 
 
 @router.get("/{fingerprint}/history", description="Get alert history")
@@ -313,6 +508,9 @@ def get_alert_history(
             "fingerprint": fingerprint,
             "tenant_id": authenticated_entity.tenant_id,
         },
+    )
+    _ensure_fingerprints_allowed(
+        authenticated_entity.tenant_id, authenticated_entity, [fingerprint]
     )
     db_alerts = get_alerts_by_fingerprint(
         tenant_id=authenticated_entity.tenant_id,
@@ -343,6 +541,9 @@ def delete_alert(
 ) -> dict[str, str]:
     tenant_id = authenticated_entity.tenant_id
     user_email = authenticated_entity.email
+    _ensure_fingerprints_allowed(
+        tenant_id, authenticated_entity, [delete_alert.fingerprint]
+    )
 
     logger.info(
         "Deleting alert",
@@ -419,6 +620,7 @@ def assign_alert(
 ) -> dict[str, str]:
     tenant_id = authenticated_entity.tenant_id
     user_email = authenticated_entity.email
+    _ensure_fingerprints_allowed(tenant_id, authenticated_entity, [fingerprint])
     logger.info(
         "Assigning alert",
         extra={
@@ -877,9 +1079,17 @@ def batch_enrich_alerts(
         )
 
         try:
+            scoped_query = _scope_query_to_allowed_presets(
+                QueryDto(cel=enrich_data.cel), tenant_id, authenticated_entity
+            )
+            if scoped_query is None:
+                return {
+                    "status": "ok",
+                    "message": "No alerts matched the query",
+                }
             db_alerts, total_count = query_last_alerts(
                 tenant_id=tenant_id,
-                query=QueryDto(cel=enrich_data.cel),
+                query=scoped_query,
             )
 
             if not db_alerts:
@@ -915,6 +1125,7 @@ def batch_enrich_alerts(
     else:
         # Use the provided fingerprints
         fingerprints = enrich_data.fingerprints
+        _ensure_fingerprints_allowed(tenant_id, authenticated_entity, fingerprints)
         logger.info(
             "Enriching alerts batch",
             extra={
@@ -1091,6 +1302,10 @@ def _enrich_alert(
             "tenant_id": tenant_id,
         },
     )
+    # Covers every route funnelling here: /enrich, /enrich/note.
+    _ensure_fingerprints_allowed(
+        tenant_id, authenticated_entity, [enrich_data.fingerprint]
+    )
 
     try:
         enrichement_bl = EnrichmentsBl(tenant_id, db=session)
@@ -1197,6 +1412,9 @@ def unenrich_alert(
             "fingerprint": enrich_data.fingerprint,
             "tenant_id": tenant_id,
         },
+    )
+    _ensure_fingerprints_allowed(
+        tenant_id, authenticated_entity, [enrich_data.fingerprint]
     )
 
     if "assignees" in enrich_data.enrichments:
@@ -1307,7 +1525,29 @@ async def search_alerts(
             extra={"tenant_id": tenant_id},
         )
         search_engine = SearchEngine(tenant_id)
-        filtered_alerts = search_engine.search_alerts(search_request.query)
+        scope_cel = _allowed_alerts_cel(tenant_id, authenticated_entity)
+        if scope_cel is _NOTHING_ALLOWED:
+            return []
+        query = search_request.query
+        scope_applied_in_query = False
+        if scope_cel is not None and search_engine.search_mode == SearchMode.INTERNAL:
+            # The internal mode runs the query through query_last_alerts, which
+            # applies `limit` in SQL. Filtering its result afterwards would cut
+            # the page down instead of scoping what fills it, so AND the scope
+            # into the CEL and let the limit apply to alerts already in scope.
+            scoped_cel = (
+                f"({query.cel_query}) && ({scope_cel})"
+                if query.cel_query
+                else scope_cel
+            )
+            query = query.copy(update={"cel_query": scoped_cel})
+            scope_applied_in_query = True
+        filtered_alerts = search_engine.search_alerts(query)
+        if not scope_applied_in_query:
+            # Elastic mode takes SQL, where the scope CEL cannot be ANDed in.
+            filtered_alerts = _filter_alerts_to_scope(
+                filtered_alerts, tenant_id, scope_cel
+            )
         logger.info(
             "Searched alerts",
             extra={"tenant_id": tenant_id},
@@ -1346,6 +1586,7 @@ def get_multiple_fingerprint_alert_audit(
         "Fetching alert audit",
         extra={"fingerprints": fingerprints, "tenant_id": tenant_id},
     )
+    _ensure_fingerprints_allowed(tenant_id, authenticated_entity, fingerprints)
     alert_audit = get_alert_audit_db(tenant_id, fingerprints)
 
     if not alert_audit:
@@ -1382,6 +1623,7 @@ def get_alert_audit(
             "tenant_id": tenant_id,
         },
     )
+    _ensure_fingerprints_allowed(tenant_id, authenticated_entity, [fingerprint])
     alert_audit = get_alert_audit_db(tenant_id, fingerprint)
     if not alert_audit:
         raise HTTPException(status_code=404, detail="Alert not found")
@@ -1402,6 +1644,14 @@ def get_alert_quality(
         "Fetching alert quality metrics per provider",
         extra={"tenant_id": authenticated_entity.tenant_id, "fields": fields},
     )
+    # Tenant-wide aggregates cannot be narrowed to a preset scope (the
+    # aggregation happens per provider in SQL), so a restricted caller gets
+    # nothing rather than everybody's counts.
+    if (
+        _allowed_alerts_cel(authenticated_entity.tenant_id, authenticated_entity)
+        is not None
+    ):
+        return {}
     start_date = time_stamp.lower_timestamp if time_stamp else None
     end_date = time_stamp.upper_timestamp if time_stamp else None
     db_alerts_quality = get_alerts_metrics_by_provider(
@@ -1431,6 +1681,11 @@ def get_error_alerts(
             "tenant_id": tenant_id,
         },
     )
+    # Error alerts are raw events that failed processing -- they never became
+    # alerts, so no preset CEL can classify them into a team's scope. Closed
+    # beats open: a restricted caller sees none of them.
+    if _allowed_alerts_cel(tenant_id, authenticated_entity) is not None:
+        return []
     error_alerts = get_error_alerts_db(tenant_id=tenant_id, limit=limit)
     error_alerts_dtos = [
         AlertErrorDto(
@@ -1463,6 +1718,13 @@ def dismiss_error_alerts(
     ),
 ) -> dict:
     tenant_id = authenticated_entity.tenant_id
+
+    # Same reasoning as get_error_alerts: error alerts cannot be classified
+    # into a scope, so a restricted caller may not touch them.
+    if _allowed_alerts_cel(tenant_id, authenticated_entity) is not None:
+        raise HTTPException(
+            status_code=403, detail="Not authorized to access these alerts"
+        )
 
     # If alert_id is provided, dismiss a specific alert
     if request and request.alert_id:

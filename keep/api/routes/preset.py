@@ -36,6 +36,9 @@ from keep.api.tasks.process_event_task import process_event
 from keep.api.tasks.process_incident_task import process_incident
 from keep.api.tasks.process_topology_task import process_topology
 from keep.identitymanager.authenticatedentity import AuthenticatedEntity
+from keep.identitymanager.identity_managers.oidc.oidc_permission_cache import (
+    invalidate_presets,
+)
 from keep.identitymanager.identitymanagerfactory import IdentityManagerFactory
 from keep.providers.base.base_provider import BaseIncidentProvider, BaseTopologyProvider
 from keep.providers.providers_factory import ProvidersFactory
@@ -228,8 +231,10 @@ def get_presets(
         preset_ids=allowed_preset_ids,
     )
     presets_dto = [PresetDto(**preset.to_dict()) for preset in presets]
-    # add static presets (unless allowed_preset_ids is set)
-    if not allowed_preset_ids:
+    # Add the static "feed" preset when unrestricted, or when a rule
+    # explicitly grants it (see oidc_resource_resolver._fetch_preset_records
+    # -- its sentinel id can only ever land in allowed_preset_ids that way).
+    if not allowed_preset_ids or str(STATIC_PRESETS["feed"].id) in allowed_preset_ids:
         presets_dto.append(STATIC_PRESETS["feed"])
     logger.info("Got all presets")
 
@@ -310,6 +315,10 @@ def create_preset(
 
     session.commit()
     session.refresh(preset)
+    # A rule like {created_by: <user>} matches this preset the moment it exists,
+    # so without this the author would not see their own preset until the cache
+    # entry expires. Best-effort: only this worker's cache, TTL bounds the rest.
+    invalidate_presets(tenant_id)
     logger.info("Created preset")
     return PresetDto(**preset.to_dict())
 
@@ -340,6 +349,7 @@ def delete_preset(
         raise HTTPException(404, "Preset not found")
     session.delete(preset)
     session.commit()
+    invalidate_presets(tenant_id)
     logger.info("Deleted preset", extra={"uuid": preset_id})
     return {}
 
@@ -414,6 +424,9 @@ def update_preset(
 
     session.commit()
     session.refresh(preset)
+    # Name, tags and created_by are all rule-matchable, so an update can move a
+    # preset in or out of a restricted role's allowed set.
+    invalidate_presets(tenant_id)
     logger.info("Updated preset", extra={"uuid": preset_id})
     return PresetDto(**preset.to_dict())
 

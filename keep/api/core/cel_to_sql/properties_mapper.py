@@ -264,6 +264,29 @@ class PropertiesMapper:
         if not isinstance(comparison_node.second_operand, ConstantNode):
             return comparison_node
 
+        if mapping.enum_int_values and comparison_node.operator in [
+            ComparisonNodeOperator.EQ,
+            ComparisonNodeOperator.NE,
+            ComparisonNodeOperator.GE,
+            ComparisonNodeOperator.GT,
+            ComparisonNodeOperator.LE,
+            ComparisonNodeOperator.LT,
+        ]:
+            # A column that stores an ordered enum as an int (e.g.
+            # incident.severity storing 1-5, not the label "critical"/"low").
+            # Real integers already sort correctly, so rewriting the constant
+            # once here covers every comparison operator directly -- unlike
+            # enum_values below, no IN-based reindexing is needed.
+            label = comparison_node.second_operand.value
+            if label in mapping.enum_int_values:
+                return ComparisonNode(
+                    first_operand=comparison_node.first_operand,
+                    operator=comparison_node.operator,
+                    second_operand=ConstantNode(
+                        value=mapping.enum_int_values[label]
+                    ),
+                )
+
         if mapping.enum_values:
             if comparison_node.operator in [
                 ComparisonNodeOperator.GE,

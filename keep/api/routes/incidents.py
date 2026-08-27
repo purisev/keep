@@ -88,6 +88,33 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
+def _ensure_incidents_allowed(
+    tenant_id: str,
+    authenticated_entity: AuthenticatedEntity,
+    incident_ids,
+) -> None:
+    """
+    Raise 403 unless every incident id is inside the caller's incident
+    permission scope. The list/facets/report routes pass the allowed ids
+    into their SQL; the id-addressed routes would otherwise accept any
+    incident id verbatim, so a restricted role could read or mutate any
+    incident in the tenant by guessing (or having once seen) its id.
+    """
+    identity_manager = IdentityManagerFactory.get_identity_manager(tenant_id)
+    # Note: if no limitations (allowed_incident_ids is []), then all incidents are allowed
+    allowed_incident_ids = identity_manager.get_user_permission_on_resource_type(
+        resource_type="incident",
+        authenticated_entity=authenticated_entity,
+    )
+    if not allowed_incident_ids:
+        return
+    allowed = {str(allowed_id) for allowed_id in allowed_incident_ids}
+    if any(str(incident_id) not in allowed for incident_id in incident_ids):
+        raise HTTPException(
+            status_code=403, detail="Not authorized to access this incident"
+        )
+
+
 @router.post(
     "",
     description="Create new incident",
@@ -357,6 +384,9 @@ def get_incident(
     ),
 ) -> IncidentDto:
     tenant_id = authenticated_entity.tenant_id
+    _ensure_incidents_allowed(
+        tenant_id, authenticated_entity, [incident_id]
+    )
     logger.info(
         "Fetching incident",
         extra={
@@ -396,6 +426,9 @@ def update_incident(
     session: Session = Depends(get_session),
 ) -> IncidentDto:
     tenant_id = authenticated_entity.tenant_id
+    _ensure_incidents_allowed(
+        tenant_id, authenticated_entity, [incident_id]
+    )
     incident_bl = IncidentBl(tenant_id, session=session, pusher_client=pusher_client)
 
     current_incident = get_incident_by_id(tenant_id, incident_id)
@@ -433,6 +466,7 @@ def bulk_delete_incidents(
     session: Session = Depends(get_session),
 ):
     tenant_id = authenticated_entity.tenant_id
+    _ensure_incidents_allowed(tenant_id, authenticated_entity, incident_ids)
     incident_bl = IncidentBl(tenant_id, session, pusher_client)
     incident_bl.bulk_delete_incidents(incident_ids)
     return Response(status_code=202)
@@ -451,6 +485,9 @@ def delete_incident(
     session: Session = Depends(get_session),
 ):
     tenant_id = authenticated_entity.tenant_id
+    _ensure_incidents_allowed(
+        tenant_id, authenticated_entity, [incident_id]
+    )
     incident_bl = IncidentBl(tenant_id, session, pusher_client)
     incident_bl.delete_incident(incident_id)
     return Response(status_code=202)
@@ -471,6 +508,9 @@ async def split_incident(
     session: Session = Depends(get_session),
 ) -> SplitIncidentResponseDto:
     tenant_id = authenticated_entity.tenant_id
+    _ensure_incidents_allowed(
+        tenant_id, authenticated_entity, [incident_id, command.destination_incident_id]
+    )
     logger.info(
         "Splitting incident",
         extra={
@@ -503,6 +543,11 @@ def merge_incidents(
     ),
 ) -> MergeIncidentsResponseDto:
     tenant_id = authenticated_entity.tenant_id
+    _ensure_incidents_allowed(
+        tenant_id,
+        authenticated_entity,
+        [*command.source_incident_ids, command.destination_incident_id],
+    )
     logger.info(
         "Merging incidents",
         extra={
@@ -553,6 +598,9 @@ def get_incident_alerts(
     ),
 ) -> AlertWithIncidentLinkMetadataPaginatedResultsDto:
     tenant_id = authenticated_entity.tenant_id
+    _ensure_incidents_allowed(
+        tenant_id, authenticated_entity, [incident_id]
+    )
     logger.info(
         "Fetching incident",
         extra={
@@ -605,6 +653,9 @@ def get_future_incidents_for_an_incident(
     ),
 ) -> IncidentsPaginatedResultsDto:
     tenant_id = authenticated_entity.tenant_id
+    _ensure_incidents_allowed(
+        tenant_id, authenticated_entity, [incident_id]
+    )
     logger.info(
         "Fetching incident",
         extra={
@@ -662,6 +713,9 @@ def get_incident_workflows(
 
     """
     tenant_id = authenticated_entity.tenant_id
+    _ensure_incidents_allowed(
+        tenant_id, authenticated_entity, [incident_id]
+    )
 
     logger.info(
         "Fetching incident's workflows",
@@ -701,6 +755,9 @@ async def add_alerts_to_incident(
     session: Session = Depends(get_session),
 ):
     tenant_id = authenticated_entity.tenant_id
+    _ensure_incidents_allowed(
+        tenant_id, authenticated_entity, [incident_id]
+    )
     incident_bl = IncidentBl(tenant_id, session, pusher_client)
     await incident_bl.add_alerts_to_incident(
         incident_id, alert_fingerprints, is_created_by_ai
@@ -724,6 +781,9 @@ def delete_alerts_from_incident(
     pusher_client: Pusher | None = Depends(get_pusher_client),
 ):
     tenant_id = authenticated_entity.tenant_id
+    _ensure_incidents_allowed(
+        tenant_id, authenticated_entity, [incident_id]
+    )
     incident_bl = IncidentBl(tenant_id, session, pusher_client)
     incident_bl.delete_alerts_from_incident(
         incident_id=incident_id, alert_fingerprints=fingerprints
@@ -819,6 +879,9 @@ def assign_incident(
         "Assigning incident to user",
         extra={"incident_id": incident_id, "assignee": authenticated_entity.email},
     )
+    _ensure_incidents_allowed(
+        authenticated_entity.tenant_id, authenticated_entity, [incident_id]
+    )
     incident = get_incident_by_id(
         authenticated_entity.tenant_id, incident_id, session=session
     )
@@ -850,6 +913,9 @@ def change_incident_status(
     session: Session = Depends(get_session),
 ) -> IncidentDto:
     tenant_id = authenticated_entity.tenant_id
+    _ensure_incidents_allowed(
+        tenant_id, authenticated_entity, [incident_id]
+    )
 
     incident_bl = IncidentBl(tenant_id, session)
 
@@ -875,6 +941,9 @@ def change_incident_severity(
     pusher_client: Pusher | None = Depends(get_pusher_client),
 ) -> IncidentDto:
     tenant_id = authenticated_entity.tenant_id
+    _ensure_incidents_allowed(
+        tenant_id, authenticated_entity, [incident_id]
+    )
     logger.info(
         "Changing the severity of an incident",
         extra={
@@ -902,6 +971,9 @@ def add_comment(
     pusher_client: Pusher = Depends(get_pusher_client),
     session: Session = Depends(get_session),
 ) -> AlertAudit:
+    _ensure_incidents_allowed(
+        authenticated_entity.tenant_id, authenticated_entity, [incident_id]
+    )
     extra = {
         "tenant_id": authenticated_entity.tenant_id,
         "commenter": authenticated_entity.email,
@@ -1029,6 +1101,9 @@ def confirm_incident(
     ),
 ) -> IncidentDto:
     tenant_id = authenticated_entity.tenant_id
+    _ensure_incidents_allowed(
+        tenant_id, authenticated_entity, [incident_id]
+    )
     logger.info(
         "Fetching incident",
         extra={
@@ -1062,6 +1137,9 @@ async def enrich_incident(
 ) -> Response:
     """Enrich incident with additional data."""
     tenant_id = authenticated_entity.tenant_id
+    _ensure_incidents_allowed(
+        tenant_id, authenticated_entity, [incident_id]
+    )
 
     # Get incident to verify it exists
     incident = get_incident_by_id(tenant_id=tenant_id, incident_id=incident_id)
@@ -1112,6 +1190,9 @@ async def unenrich_incident(
 ) -> Response:
     """Unenrich incident additional data."""
     tenant_id = authenticated_entity.tenant_id
+    _ensure_incidents_allowed(
+        tenant_id, authenticated_entity, [incident_id]
+    )
 
     # Get incident to verify it exists
     incident = get_incident_by_id(tenant_id=tenant_id, incident_id=incident_id)
