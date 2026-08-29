@@ -9,6 +9,7 @@ is ever contacted, and the URL never reaches the logs, since it carries the
 `key` and `token` credentials in its query string.
 """
 
+import json
 from unittest.mock import MagicMock, patch
 from urllib.parse import parse_qs, urlparse
 
@@ -22,6 +23,7 @@ from keep.providers.models.provider_config import ProviderConfig
 
 DEFAULT_WEBHOOK = "https://chat.googleapis.com/v1/spaces/AAAADefault/messages?key=default-key&token=default-token"
 OTHER_WEBHOOK = "https://chat.googleapis.com/v1/spaces/AAAAOther/messages?key=other-key&token=other-token"
+WEBHOOK_URLS = {"platform": DEFAULT_WEBHOOK, "network": OTHER_WEBHOOK}
 
 
 def _build_provider(**authentication) -> GoogleChatProvider:
@@ -67,11 +69,93 @@ class TestWebhookUrlResolution:
 
         assert post.call_args.args[0] == OTHER_WEBHOOK
 
-    def test_no_webhook_url_anywhere_raises(self, post):
-        with pytest.raises(ProviderException, match="webhook_url is required"):
+    def test_no_target_anywhere_raises(self, post):
+        with pytest.raises(ProviderException, match="No space to post to"):
             _build_provider().notify(message="hello")
 
         post.assert_not_called()
+
+
+class TestSpaceLookup:
+    def test_space_resolves_through_the_configured_map(self, post):
+        _build_provider(webhook_urls=WEBHOOK_URLS).notify(
+            message="hello", space="network"
+        )
+
+        assert post.call_args.args[0] == OTHER_WEBHOOK
+
+    def test_map_can_be_given_as_a_json_string(self, post):
+        _build_provider(webhook_urls=json.dumps(WEBHOOK_URLS)).notify(
+            message="hello", space="network"
+        )
+
+        assert post.call_args.args[0] == OTHER_WEBHOOK
+
+    def test_space_wins_over_the_configured_default(self, post):
+        _build_provider(webhook_url=DEFAULT_WEBHOOK, webhook_urls=WEBHOOK_URLS).notify(
+            message="hello", space="network"
+        )
+
+        assert post.call_args.args[0] == OTHER_WEBHOOK
+
+    def test_explicit_webhook_url_wins_over_space(self, post):
+        _build_provider(webhook_urls=WEBHOOK_URLS).notify(
+            message="hello", space="network", webhook_url=DEFAULT_WEBHOOK
+        )
+
+        assert post.call_args.args[0] == DEFAULT_WEBHOOK
+
+    def test_unknown_space_raises(self, post):
+        with pytest.raises(ProviderException, match="Unknown space missing"):
+            _build_provider(webhook_urls=WEBHOOK_URLS).notify(
+                message="hello", space="missing"
+            )
+
+        post.assert_not_called()
+
+    def test_space_without_a_map_raises(self, post):
+        with pytest.raises(ProviderException, match="no webhook_urls configured"):
+            _build_provider(webhook_url=DEFAULT_WEBHOOK).notify(
+                message="hello", space="network"
+            )
+
+        post.assert_not_called()
+
+    def test_the_map_never_reaches_the_error(self, post):
+        with pytest.raises(ProviderException) as exc_info:
+            _build_provider(webhook_urls=WEBHOOK_URLS).notify(
+                message="hello", space="missing"
+            )
+
+        assert "default-token" not in str(exc_info.value)
+        assert "other-token" not in str(exc_info.value)
+
+
+class TestWebhookUrlsValidation:
+    def test_malformed_json_is_rejected_at_config_time(self):
+        with pytest.raises(ProviderException, match="not valid JSON"):
+            _build_provider(webhook_urls="{not json")
+
+    def test_non_object_json_is_rejected_at_config_time(self):
+        with pytest.raises(ProviderException, match="must be a JSON object"):
+            _build_provider(webhook_urls=json.dumps(["a", "b"]))
+
+    def test_non_string_url_is_rejected_at_config_time(self):
+        with pytest.raises(ProviderException, match="must be a webhook URL string"):
+            _build_provider(webhook_urls={"network": {"url": OTHER_WEBHOOK}})
+
+    def test_foreign_host_in_the_map_is_rejected_at_config_time(self):
+        with pytest.raises(ProviderException, match="Refusing to send a message to"):
+            _build_provider(
+                webhook_urls={
+                    "network": "https://evil.example.com/v1/spaces/A/messages"
+                }
+            )
+
+    def test_an_empty_map_is_allowed(self):
+        provider = _build_provider(webhook_url=DEFAULT_WEBHOOK)
+
+        assert provider.webhook_urls == {}
 
 
 class TestWebhookUrlValidation:
