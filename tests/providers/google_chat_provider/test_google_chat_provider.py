@@ -40,6 +40,12 @@ def _build_provider(**authentication) -> GoogleChatProvider:
 
 
 @pytest.fixture
+def sleep():
+    with patch("time.sleep") as mocked_sleep:
+        yield mocked_sleep
+
+
+@pytest.fixture
 def post():
     with patch("requests.post") as mocked_post:
         mocked_post.return_value = MagicMock(status_code=200, text="{}")
@@ -152,6 +158,15 @@ class TestWebhookUrlsValidation:
                 }
             )
 
+    def test_empty_url_in_the_map_is_rejected_at_config_time(self):
+        with pytest.raises(ProviderException, match="only https is allowed"):
+            _build_provider(webhook_urls={"network": ""})
+
+    def test_an_empty_json_object_is_allowed(self):
+        provider = _build_provider(webhook_url=DEFAULT_WEBHOOK, webhook_urls="{}")
+
+        assert provider.webhook_urls == {}
+
     def test_an_empty_map_is_allowed(self):
         provider = _build_provider(webhook_url=DEFAULT_WEBHOOK)
 
@@ -253,8 +268,125 @@ class TestThreading:
         assert post.call_args.args[0] == DEFAULT_WEBHOOK
 
 
+class TestSendingAndRetries:
+    def test_a_successful_send_posts_once(self, post):
+        _build_provider(webhook_url=DEFAULT_WEBHOOK).notify(message="hello")
+
+        assert post.call_count == 1
+
+    def test_a_transient_failure_is_retried_and_then_succeeds(self, post, sleep):
+        post.side_effect = [
+            requests.exceptions.ConnectionError("connection reset"),
+            MagicMock(status_code=200, text="{}"),
+        ]
+
+        _build_provider(webhook_url=DEFAULT_WEBHOOK).notify(message="hello")
+
+        assert post.call_count == 2
+        assert sleep.call_count == 1
+
+    def test_a_persistent_failure_gives_up_after_three_attempts(self, post, sleep):
+        post.return_value = MagicMock(status_code=503, text="service unavailable")
+
+        with pytest.raises(
+            requests.exceptions.RequestException, match="after 3 attempts"
+        ):
+            _build_provider(webhook_url=DEFAULT_WEBHOOK).notify(message="hello")
+
+        assert post.call_count == 3
+        assert sleep.call_count == 2
+
+    def test_the_failing_response_body_reaches_the_caller(self, post, sleep):
+        post.return_value = MagicMock(status_code=400, text="Invalid thread key")
+
+        with pytest.raises(requests.exceptions.RequestException) as exc_info:
+            _build_provider(webhook_url=DEFAULT_WEBHOOK).notify(message="hello")
+
+        assert "status code 400" in str(exc_info.value)
+        assert "Invalid thread key" in str(exc_info.value)
+
+    def test_a_failing_response_body_is_redacted(self, post, sleep):
+        post.return_value = MagicMock(
+            status_code=403, text=f"forbidden for {DEFAULT_WEBHOOK}"
+        )
+
+        with pytest.raises(requests.exceptions.RequestException) as exc_info:
+            _build_provider(webhook_url=DEFAULT_WEBHOOK).notify(message="hello")
+
+        assert "default-key" not in str(exc_info.value)
+        assert "default-token" not in str(exc_info.value)
+        assert "key=<redacted>" in str(exc_info.value)
+
+    def test_the_content_type_header_is_sent(self, post):
+        _build_provider(webhook_url=DEFAULT_WEBHOOK).notify(message="hello")
+
+        assert (
+            post.call_args.kwargs["headers"]["Content-Type"]
+            == "application/json; charset=UTF-8"
+        )
+
+    def test_unrelated_workflow_parameters_are_ignored(self, post):
+        _build_provider(webhook_url=DEFAULT_WEBHOOK).notify(
+            message="hello", severity="critical", fingerprint="abc123"
+        )
+
+        assert post.call_args.kwargs["json"] == {"text": "hello"}
+
+
+class TestMechanicsTogether:
+    def test_space_lookup_and_threading(self, post):
+        _build_provider(webhook_urls=WEBHOOK_URLS).notify(
+            message="hello", space="network", thread_key="alert-fingerprint"
+        )
+
+        sent_url = post.call_args.args[0]
+        query = parse_qs(urlparse(sent_url).query)
+        assert urlparse(sent_url).path == urlparse(OTHER_WEBHOOK).path
+        assert query["token"] == ["other-token"]
+        assert query["messageReplyOption"] == ["REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD"]
+        assert post.call_args.kwargs["json"]["thread"] == {
+            "threadKey": "alert-fingerprint"
+        }
+
+    def test_space_lookup_and_cards(self, post):
+        cards = [{"cardId": "alert", "card": {"header": {"title": "Alert"}}}]
+
+        _build_provider(webhook_urls=WEBHOOK_URLS).notify(
+            space="platform", cards_v2=cards
+        )
+
+        assert post.call_args.args[0] == DEFAULT_WEBHOOK
+        assert post.call_args.kwargs["json"] == {"cardsV2": cards}
+
+    def test_threading_on_a_url_without_a_query_string(self, post):
+        bare = "https://chat.googleapis.com/v1/spaces/AAAABare/messages"
+
+        _build_provider().notify(
+            message="hello", webhook_url=bare, thread_key="alert-fingerprint"
+        )
+
+        assert post.call_args.args[0] == (
+            bare + "?messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD"
+        )
+
+    def test_an_empty_cards_v2_is_not_a_body(self, post):
+        with pytest.raises(ProviderException, match="Either message or cards_v2"):
+            _build_provider(webhook_url=DEFAULT_WEBHOOK).notify(cards_v2=[])
+
+        post.assert_not_called()
+
+    def test_an_explicit_none_webhook_url_falls_back_to_the_default(self, post):
+        _build_provider(webhook_url=DEFAULT_WEBHOOK).notify(
+            message="hello", webhook_url=None
+        )
+
+        assert post.call_args.args[0] == DEFAULT_WEBHOOK
+
+
 class TestCredentialsAreNotLogged:
-    def test_request_failure_is_logged_without_the_credentials(self, post, caplog):
+    def test_request_failure_is_logged_without_the_credentials(
+        self, post, sleep, caplog
+    ):
         post.side_effect = requests.exceptions.ConnectionError(
             f"Failed to establish a new connection to {DEFAULT_WEBHOOK}"
         )
@@ -265,6 +397,16 @@ class TestCredentialsAreNotLogged:
         assert "default-key" not in caplog.text
         assert "default-token" not in caplog.text
         assert "key=<redacted>" in caplog.text
+
+    def test_an_unexpected_path_logs_a_placeholder_space(self, post, caplog):
+        provider = _build_provider()
+
+        with caplog.at_level("DEBUG", logger=provider.provider_id):
+            provider.notify(message="hello", webhook_url="https://chat.googleapis.com/")
+
+        assert any(
+            getattr(record, "space", None) == "unknown" for record in caplog.records
+        )
 
     def test_space_is_logged_instead_of_the_url(self, post, caplog):
         # the provider pins its own log level on init, so build it first
