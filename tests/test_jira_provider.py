@@ -371,6 +371,8 @@ class TestJiraProvider:
         request_url = mock_get.call_args[0][0]
         assert "/rest/api/2/search" in request_url
         assert "maxResults=0" in request_url
+        assert "fields" not in request_url
+        assert "issues" not in result
         assert mock_get.call_args[1]["verify"] is False
 
     @patch("requests.get")
@@ -394,3 +396,46 @@ class TestJiraProvider:
 
         assert result == {"issue": {"key": "TEST-1", "id": "1"}}
         assert "/rest/api/2/issue/TEST-1" in mock_get.call_args[0][0]
+
+    @patch("requests.get")
+    def test_jiraonprem_query_with_jql_returning_issues(
+        self, mock_get, jiraonprem_provider
+    ):
+        """Test that max_results asks Jira for the issues and returns them"""
+        mock_get.return_value.ok = True
+        mock_get.return_value.json.return_value = {
+            "total": 2,
+            "issues": [{"key": "TEST-1"}, {"key": "TEST-2"}],
+        }
+
+        result = jiraonprem_provider.query(jql="status = Open", max_results=50)
+
+        assert result["total"] == 2
+        assert [issue["key"] for issue in result["issues"]] == ["TEST-1", "TEST-2"]
+        assert "maxResults=50" in mock_get.call_args[0][0]
+
+    @patch("requests.get")
+    def test_jiraonprem_query_with_jql_fields(self, mock_get, jiraonprem_provider):
+        """Test that fields are passed through, as a string or as a list"""
+        mock_get.return_value.ok = True
+        mock_get.return_value.json.return_value = {"total": 1, "issues": [{}]}
+
+        jiraonprem_provider.query(
+            jql="status = Open", max_results=1, fields="summary,status"
+        )
+        assert "fields=summary%2Cstatus" in mock_get.call_args[0][0]
+
+        jiraonprem_provider.query(
+            jql="status = Open", max_results=1, fields=["summary", "status"]
+        )
+        assert "fields=summary%2Cstatus" in mock_get.call_args[0][0]
+
+    @patch("requests.get")
+    def test_jiraonprem_query_with_non_numeric_max_results(
+        self, mock_get, jiraonprem_provider
+    ):
+        """Test that a max_results that is not a number is refused before the request"""
+        with pytest.raises(ProviderException, match="non-numeric max_results"):
+            jiraonprem_provider.query(jql="status = Open", max_results="fifty")
+
+        mock_get.assert_not_called()
