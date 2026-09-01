@@ -22,13 +22,35 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+PRESET_ENV_KEYS = ("KEEP_PRESETS", "KEEP_PRESETS_FILE")
+ORIGINAL_PRESET_ENV = {key: os.environ.get(key) for key in PRESET_ENV_KEYS}
+
+
 def fresh(**env):
     """Reload the provisioning module with a clean, explicit environment."""
-    for key in ("KEEP_PRESETS", "KEEP_PRESETS_FILE"):
+    for key in PRESET_ENV_KEYS:
         os.environ.pop(key, None)
     os.environ.update(env)
     sys.modules.pop("keep.api.core.presets_provisioning", None)
     return importlib.import_module("keep.api.core.presets_provisioning")
+
+
+def teardown_function(function=None):
+    """
+    Put the environment back the way each test found it.
+
+    fresh() writes straight into os.environ, so without this the last
+    configuration a test sets stays there for the rest of the pytest process.
+    test_malformed_sources_raise leaves KEEP_PRESETS_FILE pointing at a file
+    that does not exist, which then makes provision_resources() raise while
+    building the app in the client fixtures, so every later test in the same
+    xdist worker errors out during setup.
+    """
+    for key, value in ORIGINAL_PRESET_ENV.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
 
 
 def assert_invalid(why, module, definition):
@@ -155,6 +177,14 @@ def test_malformed_sources_raise():
         raise AssertionError(f"malformed source accepted: {why} ({module_name})")
 
 
+def test_teardown_restores_the_environment():
+    """The guard that keeps a broken configuration inside this file."""
+    fresh(KEEP_PRESETS_FILE="/nonexistent/presets.yaml")
+    teardown_function()
+    for key, value in ORIGINAL_PRESET_ENV.items():
+        assert os.environ.get(key) == value, f"{key} was left behind"
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):
@@ -165,6 +195,8 @@ if __name__ == "__main__":
             except Exception as exc:  # noqa: BLE001 - standalone runner
                 failures += 1
                 print(f"FAIL {name}: {type(exc).__name__}: {exc}")
+            finally:
+                teardown_function()
     print()
     if failures:
         print(f"{failures} TEST(S) FAILED")
