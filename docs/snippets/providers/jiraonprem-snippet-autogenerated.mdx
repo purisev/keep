@@ -32,7 +32,9 @@ steps:
       with:
         ticket_id: {value}  # The ticket id.
         board_id: {value}  # The board id.
-        jql: {value}  # A JQL query to count the matching issues with.
+        jql: {value}  # A JQL query to search the issues with.
+        max_results: {value}  # How many issues to return alongside the total. Zero, the default, returns the total only.
+        fields: {value}  # Comma separated Jira fields to return for each issue, or a list of them. All fields when empty.
 ```
 
 
