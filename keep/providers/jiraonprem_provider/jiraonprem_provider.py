@@ -590,7 +590,7 @@ class JiraonpremProvider(BaseProvider):
             }
             raise ProviderException(f"Failed to notify jira: {e} - Params: {context}")
 
-    def _query(self, ticket_id="", board_id="", **kwargs: dict):
+    def _query(self, ticket_id="", board_id="", jql="", **kwargs: dict):
         """
         API for fetching issues:
         https://developer.atlassian.com/cloud/jira/software/rest/api-group-board/#api-rest-agile-1-0-board-boardid-issue-get
@@ -598,8 +598,26 @@ class JiraonpremProvider(BaseProvider):
         Args:
             ticket_id (str): The ticket id.
             board_id (str): The board id.
+            jql (str): A JQL query to count the matching issues with.
         """
-        if not ticket_id:
+        if jql:
+            # maxResults=0 makes Jira return only the total, without the issues
+            request_url = self.__get_url(
+                paths=["search"],
+                query_params={"jql": jql, "maxResults": 0},
+            )
+            response = requests.get(
+                request_url,
+                headers=self.__get_auth_header(),
+                verify=self.authentication_config.verify,
+                timeout=10,
+            )
+            if not response.ok:
+                raise ProviderException(
+                    f"{self.__class__.__name__} failed to fetch data from Jira: {response.text}"
+                )
+            return {"total": response.json().get("total", 0), "jql": jql}
+        elif not ticket_id:
             request_url = (
                 f"https://{self.jira_host}/rest/agile/1.0/board/{board_id}/issue"
             )
