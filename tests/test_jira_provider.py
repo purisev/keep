@@ -366,13 +366,14 @@ class TestJiraProvider:
         jql = "project = TEST AND status = Open"
         result = jiraonprem_provider.query(jql=jql)
 
-        assert result == {"total": 7, "jql": jql}
+        # issues is there and empty rather than missing, so a foreach over it in a
+        # workflow that forgot max_results iterates over nothing.
+        assert result == {"total": 7, "jql": jql, "issues": []}
 
         request_url = mock_get.call_args[0][0]
         assert "/rest/api/2/search" in request_url
         assert "maxResults=0" in request_url
         assert "fields" not in request_url
-        assert "issues" not in result
         assert mock_get.call_args[1]["verify"] is False
 
     @patch("requests.get")

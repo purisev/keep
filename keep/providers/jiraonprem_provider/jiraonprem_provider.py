@@ -607,7 +607,7 @@ class JiraonpremProvider(BaseProvider):
             ticket_id (str): The ticket id.
             board_id (str): The board id.
             jql (str): A JQL query to search the issues with.
-            max_results (int): How many issues to return alongside the total. Zero, the default, returns the total only.
+            max_results (int): How many issues to return alongside the total. Zero, the default, returns the total and an empty issues list.
             fields (str): Comma separated Jira fields to return for each issue, or a list of them. All fields when empty.
         """
         if jql:
@@ -639,10 +639,15 @@ class JiraonpremProvider(BaseProvider):
                     f"{self.__class__.__name__} failed to fetch data from Jira: {response.text}"
                 )
             search = response.json()
-            result = {"total": search.get("total", 0), "jql": jql}
-            if max_results:
-                result["issues"] = search.get("issues", [])
-            return result
+            # Jira sends back no issues at all when maxResults is zero, and issues
+            # stays an empty list rather than going missing, so a workflow that
+            # forgets max_results gets a foreach over nothing instead of an
+            # undefined key.
+            return {
+                "total": search.get("total", 0),
+                "jql": jql,
+                "issues": search.get("issues", []),
+            }
         elif not ticket_id:
             request_url = (
                 f"https://{self.jira_host}/rest/agile/1.0/board/{board_id}/issue"
