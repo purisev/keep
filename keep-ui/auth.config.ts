@@ -8,6 +8,7 @@ import Okta from "next-auth/providers/okta";
 import OneLogin from "next-auth/providers/onelogin";
 import {AuthenticationError, AuthErrorCodes} from "@/errors";
 import type {JWT} from "next-auth/jwt";
+import type {Provider} from "next-auth/providers";
 import {getApiURL} from "@/utils/apiUrl";
 import {
   AuthType,
@@ -43,7 +44,19 @@ export const authType =
       ? AuthType.DB
       : authTypeEnv === NO_AUTH
         ? AuthType.NOAUTH
-        : (authTypeEnv as AuthType);
+        : // The backend spells it "oidc"; accept either casing.
+          (authTypeEnv?.toUpperCase() as AuthType);
+
+// An AUTH_TYPE the frontend does not know used to fall through to the NOAUTH
+// provider further down, which silently let everyone in without an IdP and
+// made the misconfiguration look like a CSRF bug. Fail loudly instead.
+// An unset AUTH_TYPE still means NOAUTH, as documented.
+if (authTypeEnv && !Object.values(AuthType).includes(authType)) {
+  throw new Error(
+    `Unsupported AUTH_TYPE ${JSON.stringify(authTypeEnv)}. Supported values: ` +
+      Object.values(AuthType).join(", ")
+  );
+}
 
 export const proxyUrl =
   process.env.HTTP_PROXY ||
@@ -51,11 +64,198 @@ export const proxyUrl =
   process.env.http_proxy ||
   process.env.https_proxy;
 
+// Auth types whose access token can be renewed with a refresh_token grant.
+const REFRESHABLE_AUTH_TYPES: AuthType[] = [
+  AuthType.KEYCLOAK,
+  AuthType.OKTA,
+  AuthType.ONELOGIN,
+  AuthType.AZUREAD,
+  AuthType.AUTH0,
+  AuthType.OIDC,
+];
+
+// --------------------------------------------------------------------------
+// Generic OIDC (AUTH_TYPE=oidc)
+//
+// The counterpart of keep/identitymanager/identity_managers/oidc on the
+// backend, and deliberately configured through the same KEEP_OIDC_* variables
+// so one set of env vars describes both halves. The backend stays authoritative
+// for authorization: it validates the bearer token against the IdP's JWKS and
+// resolves the role itself. What is read here only drives the UI - which tenant
+// to display and which role gates which page.
+// --------------------------------------------------------------------------
+
+// Which token Keep's backend receives as the bearer. On most IdPs the access
+// token is a JWT, but not all of them (Auth0 issues an opaque one unless an API
+// audience is requested), so this is configurable. It has to agree with
+// KEEP_OIDC_AUDIENCE on the backend, since aud differs between the two tokens.
+const oidcBearerTokenKind =
+  runtimeEnv("KEEP_OIDC_BEARER_TOKEN")?.trim().toLowerCase() === "id_token"
+    ? "id_token"
+    : "access_token";
+
+function oidcBearerToken(tokens: {
+  access_token?: string | null;
+  id_token?: string | null;
+}): string | undefined {
+  const token =
+    oidcBearerTokenKind === "id_token" ? tokens.id_token : tokens.access_token;
+  return token ?? undefined;
+}
+
+// Decoded, not verified - the backend does the verification that matters.
+function decodeJwtClaims(token: string | undefined): Record<string, any> {
+  const payload = token?.split(".")[1];
+  if (!payload) {
+    return {};
+  }
+  try {
+    // base64url -> base64; the "base64url" encoding name is not available in
+    // every runtime this callback runs in (it also runs in the Edge runtime).
+    const base64 = payload.replace(/-/g, "+").replace(/_/g, "/");
+    return JSON.parse(Buffer.from(base64, "base64").toString());
+  } catch (error) {
+    console.warn("Failed to decode OIDC token claims:", error);
+    return {};
+  }
+}
+
+// Dotted claim path, same notation as the KEEP_OIDC_*_CLAIM variables.
+function readClaim(claims: Record<string, any>, path: string): any {
+  return path
+    .split(".")
+    .reduce(
+      (node: any, part) =>
+        node && typeof node === "object" ? node[part] : undefined,
+      claims
+    );
+}
+
+// Providers disagree on the shape of a groups claim: a JSON array, a single
+// string, or a comma-separated string. Mirrors _as_list() on the backend.
+function claimAsList(value: any): string[] {
+  if (typeof value === "string") {
+    return value
+      .split(",")
+      .map((item) => item.trim())
+      .filter(Boolean);
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item).trim()).filter(Boolean);
+  }
+  return [];
+}
+
+// Only the inline JSON form; KEEP_OIDC_ROLE_MAPPINGS_FILE is backend-only,
+// because this runs in the Edge runtime where there is no filesystem.
+function oidcRoleMappings(): { group: string; role: string }[] {
+  const inline = runtimeEnv("KEEP_OIDC_ROLE_MAPPINGS")?.trim();
+  if (!inline) {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(inline);
+    const entries = Array.isArray(parsed) ? parsed : (parsed?.mappings ?? []);
+    return entries.filter((entry: any) => entry?.group && entry?.role);
+  } catch (error) {
+    console.error("Cannot parse KEEP_OIDC_ROLE_MAPPINGS as JSON:", error);
+    return [];
+  }
+}
+
+// Mirrors OidcAuthVerifier._resolve_role: an explicit role claim wins, then the
+// ordered group mappings, then the configured default.
+// KEEP_OIDC_ROLE_COMPOSITION=union is not reproduced - a composite role only
+// changes what the backend returns, which it works out on its own.
+function resolveOidcRole(claims: Record<string, any>): string | undefined {
+  const roleClaim = runtimeEnv("KEEP_OIDC_ROLE_CLAIM")?.trim();
+  if (roleClaim) {
+    const value = readClaim(claims, roleClaim);
+    const roleName = Array.isArray(value) ? value[0] : value;
+    if (roleName) {
+      return String(roleName);
+    }
+  }
+
+  const groups = claimAsList(
+    readClaim(claims, runtimeEnv("KEEP_OIDC_GROUPS_CLAIM") || "groups")
+  );
+  for (const { group, role } of oidcRoleMappings()) {
+    if (groups.includes(group)) {
+      return role;
+    }
+  }
+
+  return runtimeEnv("KEEP_OIDC_DEFAULT_ROLE")?.trim() || undefined;
+}
+
+function oidcIssuer(): string {
+  return (runtimeEnv("KEEP_OIDC_ISSUER") || "").replace(/\/$/, "");
+}
+
+// Discovered once per process: the refresh grant needs the token endpoint, and
+// unlike the provider itself this call is not routed through Auth.js.
+let discoveredOidcTokenEndpoint: string | undefined;
+
+async function oidcTokenEndpoint(): Promise<string> {
+  const configured = runtimeEnv("KEEP_OIDC_TOKEN_URL")?.trim();
+  if (configured) {
+    return configured;
+  }
+  if (discoveredOidcTokenEndpoint) {
+    return discoveredOidcTokenEndpoint;
+  }
+  const url = `${oidcIssuer()}/.well-known/openid-configuration`;
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(
+      `OIDC discovery failed for ${url}: ${response.status} ${response.statusText}. ` +
+        "Set KEEP_OIDC_TOKEN_URL to skip discovery."
+    );
+  }
+  const metadata = await response.json();
+  if (!metadata.token_endpoint) {
+    throw new Error(`No token_endpoint in provider metadata at ${url}`);
+  }
+  const endpoint = metadata.token_endpoint as string;
+  discoveredOidcTokenEndpoint = endpoint;
+  return endpoint;
+}
+
+// These providers hand Keep the id_token as the bearer token instead of the
+// access token (see the jwt callback below), so the refreshed pair has to be
+// picked the same way.
+const ID_TOKEN_AS_ACCESS_TOKEN: AuthType[] = [
+  AuthType.AUTH0,
+  AuthType.ONELOGIN,
+];
+
+// Renew a bit before the real expiry so an in-flight request never races it.
+const ACCESS_TOKEN_REFRESH_SKEW_MS = 60 * 1000;
+
+// offline_access is what makes the IdP issue a refresh_token in the first
+// place. Keycloak hands one out without it (and asking would turn it into a
+// long-lived offline token), so it is only requested where the IdP needs it.
+// Escape hatch for IdPs configured to reject the scope.
+const requestOfflineAccess =
+  runtimeEnv("AUTH_DISABLE_OFFLINE_ACCESS") !== "true";
+
+function withOfflineAccess(scope: string): string {
+  return requestOfflineAccess ? `${scope} offline_access` : scope;
+}
+
+function azureAdScope(): string {
+  return withOfflineAccess(
+    `api://${process.env.KEEP_AZUREAD_CLIENT_ID!}/default openid profile email`
+  );
+}
+
 async function refreshAccessToken(token: any) {
   let issuerUrl = "";
   let clientId = "";
   let clientSecret = "";
   let refreshTokenUrl = "";
+  let scope = "";
 
   switch (authType) {
     case AuthType.KEYCLOAK: {
@@ -79,38 +279,87 @@ async function refreshAccessToken(token: any) {
       refreshTokenUrl = `${issuerUrl}/token`;
       break;
     }
+    case AuthType.AZUREAD: {
+      // NOTE: when HTTP_PROXY is set, the provider itself is proxied via
+      // customFetch in auth.ts, but this call is not - it goes out directly.
+      clientId = process.env.KEEP_AZUREAD_CLIENT_ID || "";
+      clientSecret = process.env.KEEP_AZUREAD_CLIENT_SECRET || "";
+      refreshTokenUrl = `https://login.microsoftonline.com/${process.env
+        .KEEP_AZUREAD_TENANT_ID!}/oauth2/v2.0/token`;
+      // Entra ID requires the scope to be repeated on the refresh grant.
+      scope = azureAdScope();
+      break;
+    }
+    case AuthType.AUTH0: {
+      issuerUrl = (process.env.AUTH0_ISSUER || "").replace(/\/$/, "");
+      clientId = process.env.AUTH0_CLIENT_ID || "";
+      clientSecret = process.env.AUTH0_CLIENT_SECRET || "";
+      refreshTokenUrl = `${issuerUrl}/oauth/token`;
+      break;
+    }
+    case AuthType.OIDC: {
+      clientId = process.env.KEEP_OIDC_CLIENT_ID || "";
+      clientSecret = process.env.KEEP_OIDC_CLIENT_SECRET || "";
+      // refreshTokenUrl comes from discovery, resolved inside the try below so
+      // that a discovery failure is reported as a refresh error instead of
+      // being thrown out of the jwt callback.
+      break;
+    }
     default: {
       throw new Error("Refresh token not supported for this auth type");
     }
   }
 
   try {
+    if (authType === AuthType.OIDC) {
+      refreshTokenUrl = await oidcTokenEndpoint();
+    }
+
+    const body = new URLSearchParams({
+      client_id: clientId,
+      client_secret: clientSecret,
+      grant_type: "refresh_token",
+      refresh_token: token.refreshToken,
+    });
+    if (scope) {
+      body.set("scope", scope);
+    }
+
     const response = await fetch(refreshTokenUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/x-www-form-urlencoded",
       },
-      body: new URLSearchParams({
-        client_id: clientId,
-        client_secret: clientSecret,
-        grant_type: "refresh_token",
-        refresh_token: token.refreshToken,
-      }),
+      body,
     });
 
     const refreshedTokens = await response.json();
 
     if (!response.ok) {
       throw new Error(
-        `Refresh token failed: ${response.status} ${response.statusText}`
+        `Refresh token failed: ${response.status} ${response.statusText} ${
+          refreshedTokens?.error_description ?? refreshedTokens?.error ?? ""
+        }`
       );
+    }
+
+    const accessToken =
+      authType === AuthType.OIDC
+        ? oidcBearerToken(refreshedTokens)
+        : ID_TOKEN_AS_ACCESS_TOKEN.includes(authType)
+          ? refreshedTokens.id_token
+          : refreshedTokens.access_token;
+
+    if (!accessToken) {
+      throw new Error("Refresh token response did not contain a usable token");
     }
 
     return {
       ...token,
-      accessToken: refreshedTokens.access_token,
+      accessToken,
       accessTokenExpires: Date.now() + (refreshedTokens.expires_in || 3600) * 1000,
       refreshToken: refreshedTokens.refresh_token ?? token.refreshToken,
+      error: undefined,
     };
   } catch (error) {
     console.error("Error refreshing access token:", error);
@@ -132,6 +381,7 @@ const baseProviderConfigs = {
       authorization: {
         params: {
           prompt: "login",
+          scope: withOfflineAccess("openid email profile"),
         },
       },
     }),
@@ -258,7 +508,9 @@ const baseProviderConfigs = {
       clientId: process.env.OKTA_CLIENT_ID!,
       clientSecret: process.env.OKTA_CLIENT_SECRET!,
       issuer: process.env.OKTA_ISSUER!,
-      authorization: { params: { scope: "openid email profile" } },
+      authorization: {
+        params: { scope: withOfflineAccess("openid email profile") },
+      },
     }),
   ],
   [AuthType.ONELOGIN]: [
@@ -266,9 +518,49 @@ const baseProviderConfigs = {
       clientId: process.env.ONELOGIN_CLIENT_ID!,
       clientSecret: process.env.ONELOGIN_CLIENT_SECRET!,
       issuer: process.env.ONELOGIN_ISSUER!,
-      authorization: { params: { scope: "openid email profile groups" } },
+      authorization: {
+        params: { scope: withOfflineAccess("openid email profile groups") },
+      },
     }),
   ],
+  [AuthType.OIDC]: [
+    {
+      id: "oidc",
+      name: process.env.KEEP_OIDC_DISPLAY_NAME || "SSO",
+      type: "oidc" as const,
+      // Auth.js discovers the authorization, token and userinfo endpoints from
+      // the issuer, the same metadata document the backend uses for JWKS.
+      issuer: oidcIssuer(),
+      clientId: process.env.KEEP_OIDC_CLIENT_ID!,
+      clientSecret: process.env.KEEP_OIDC_CLIENT_SECRET!,
+      authorization: {
+        params: {
+          scope: withOfflineAccess(
+            process.env.KEEP_OIDC_SCOPES || "openid email profile"
+          ),
+        },
+      },
+      client: {
+        token_endpoint_auth_method:
+          process.env.KEEP_OIDC_TOKEN_AUTH_METHOD || "client_secret_post",
+      },
+      checks: ["pkce", "state"],
+      profile(profile: any, tokens: any) {
+        const emailClaim = process.env.KEEP_OIDC_EMAIL_CLAIM || "email";
+        const email =
+          readClaim(profile, emailClaim) ||
+          profile.preferred_username ||
+          profile.sub;
+        return {
+          id: profile.sub,
+          name: profile.name || profile.preferred_username || email,
+          email,
+          image: null,
+          accessToken: oidcBearerToken(tokens) ?? "",
+        };
+      },
+    },
+  ] as Provider[],
   [AuthType.AZUREAD]: [
     MicrosoftEntraID({
       clientId: process.env.KEEP_AZUREAD_CLIENT_ID!,
@@ -277,8 +569,7 @@ const baseProviderConfigs = {
         .KEEP_AZUREAD_TENANT_ID!}/v2.0`,
       authorization: {
         params: {
-          scope: `api://${process.env
-            .KEEP_AZUREAD_CLIENT_ID!}/default openid profile email`,
+          scope: azureAdScope(),
         },
       },
       client: {
@@ -335,9 +626,7 @@ export const config = {
           accessToken = account.access_token;
           if (account.id_token) {
             try {
-              const payload = JSON.parse(
-                Buffer.from(account.id_token.split(".")[1], "base64").toString()
-              );
+              const payload = decodeJwtClaims(account.id_token);
               role = payload.roles?.[0] || "user";
               tenantId = payload.tid || undefined;
             } catch (e) {
@@ -366,6 +655,17 @@ export const config = {
           tenantId = (profile as any).keep_tenant_id || "keep";
           role = (profile as any).keep_role || "user";
           accessToken = account.access_token;
+        } else if (authType === AuthType.OIDC) {
+          accessToken = oidcBearerToken(account);
+          // The backend re-derives both from the same claims; these copies only
+          // drive the UI (tenant display, role-gated routes).
+          const claims = decodeJwtClaims(accessToken);
+          tenantId =
+            readClaim(
+              claims,
+              process.env.KEEP_OIDC_TENANT_CLAIM || "keep_tenant_id"
+            ) || "keep";
+          role = resolveOidcRole(claims) || "user";
         } else if (authType === AuthType.ONELOGIN) {
           // Extract tenant and role from OneLogin token - use ID token for user data
           tenantId = (profile as any).keep_tenant_id || "keep";
@@ -460,23 +760,25 @@ export const config = {
           }
         }
 
-        // Refresh token logic for Keycloak, Okta and OneLogin
-        if (authType === AuthType.KEYCLOAK || authType === AuthType.OKTA || authType === AuthType.ONELOGIN) {
+        // Keep what is needed to renew the access token later on
+        if (REFRESHABLE_AUTH_TYPES.includes(authType)) {
           token.refreshToken = account.refresh_token;
-          token.accessTokenExpires =
-            Date.now() + (account.expires_in as number) * 1000;
+          token.accessTokenExpires = account.expires_at
+            ? (account.expires_at as number) * 1000
+            : Date.now() + (((account.expires_in as number) || 3600) * 1000);
         }
       } else if (
-        (authType === AuthType.KEYCLOAK || authType === AuthType.OKTA || authType === AuthType.ONELOGIN) &&
+        REFRESHABLE_AUTH_TYPES.includes(authType) &&
         token.refreshToken &&
         token.accessTokenExpires &&
         typeof token.accessTokenExpires === "number" &&
-        Date.now() > token.accessTokenExpires
+        Date.now() > token.accessTokenExpires - ACCESS_TOKEN_REFRESH_SKEW_MS
       ) {
+        // Runs on every session read, so an open tab renews its token in the
+        // background instead of being signed out the moment it expires.
+        // A failure is reported through token.error (see the session callback)
+        // rather than thrown, so the session survives a transient IdP hiccup.
         token = await refreshAccessToken(token);
-        if (!token.accessToken) {
-          throw new Error("Failed to refresh access token");
-        }
       }
 
       return token;
@@ -484,6 +786,9 @@ export const config = {
     session: async ({ session, token, user }) => {
       return {
         ...session,
+        // Surfaced so the client can react to a dead refresh token instead of
+        // waiting for the backend to answer 401.
+        error: token.error as string | undefined,
         accessToken: token.accessToken as string,
         tenantId: token.tenantId as string,
         userRole: token.role as string,

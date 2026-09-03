@@ -43,6 +43,14 @@ export function getAuthTypeEnvVars(authType: string | undefined): AuthEnvVars {
         ONELOGIN_CLIENT_SECRET: maskValue(process.env.ONELOGIN_CLIENT_SECRET),
         ONELOGIN_ISSUER: maskValue(process.env.ONELOGIN_ISSUER),
       };
+    case AuthType.OIDC:
+      return {
+        KEEP_OIDC_ISSUER: maskValue(process.env.KEEP_OIDC_ISSUER),
+        KEEP_OIDC_CLIENT_ID: maskValue(process.env.KEEP_OIDC_CLIENT_ID),
+        KEEP_OIDC_CLIENT_SECRET: maskValue(process.env.KEEP_OIDC_CLIENT_SECRET),
+        KEEP_OIDC_SCOPES: maskValue(process.env.KEEP_OIDC_SCOPES),
+        KEEP_OIDC_BEARER_TOKEN: maskValue(process.env.KEEP_OIDC_BEARER_TOKEN),
+      };
     case AuthType.DB:
       return {
         API_URL: maskValue(process.env.API_URL),

@@ -4,7 +4,7 @@ import { KeepApiError, KeepApiReadOnlyError } from "./KeepApiError";
 import { getApiUrlFromConfig } from "@/shared/lib/getApiUrlFromConfig";
 import { getApiURL } from "@/utils/apiUrl";
 import * as Sentry from "@sentry/nextjs";
-import { signOut as signOutClient } from "next-auth/react";
+import { getSession, signOut as signOutClient } from "next-auth/react";
 import { GuestSession } from "@/types/auth";
 import { AuthType } from "@/utils/authenticationType";
 
@@ -20,6 +20,43 @@ const READ_ONLY_ALWAYS_ALLOWED_URLS = [
 
 interface ApiClientOptions {
   headers?: Record<string, string>;
+}
+
+// Shared by every ApiClient instance: a burst of parallel 401s (background
+// polling on alerts, incidents, presets, health) must trigger at most one
+// session renewal and at most one sign-out.
+let sessionRenewal: Promise<Session | null> | null = null;
+let isSigningOut = false;
+
+function renewSession(): Promise<Session | null> {
+  if (!sessionRenewal) {
+    // Hits /api/auth/session, which runs the jwt callback and, when the access
+    // token is expired, the refresh_token grant in auth.config.ts.
+    sessionRenewal = getSession().finally(() => {
+      sessionRenewal = null;
+    });
+  }
+  return sessionRenewal;
+}
+
+// next-auth's signOut() defaults to redirect: true, which does a full page load
+// and drops the user wherever the default redirect points - losing the filters,
+// scroll position and open dialogs of the page they were working on. Sign out
+// without that redirect and send them back to the same URL after logging in.
+async function signOutAndReturn() {
+  if (isSigningOut) {
+    return;
+  }
+  isSigningOut = true;
+  const callbackUrl = window.location.href;
+  try {
+    await signOutClient({ redirect: false });
+  } catch (error) {
+    console.error("Error signing out:", error);
+  }
+  window.location.href = `/signin?callbackUrl=${encodeURIComponent(
+    callbackUrl
+  )}`;
 }
 
 export class ApiClient {
@@ -82,7 +119,7 @@ export class ApiClient {
             if (this.config?.AUTH_TYPE === AuthType.OAUTH2PROXY) {
               window.location.href = "/oauth2/sign_out";
             } else {
-              await signOutClient();
+              await signOutAndReturn();
             }
           }
           throw new KeepApiError(
@@ -162,14 +199,53 @@ export class ApiClient {
       : getApiUrlFromConfig(this.config);
     const fullUrl = apiUrl + url;
 
-    const response = await fetch(fullUrl, {
-      ...requestInit,
-      headers: {
-        ...(this.getHeaders() as HeadersInit),
-        ...requestInit.headers,
-      },
-    });
+    const headers: Record<string, any> = {
+      ...(this.getHeaders() as Record<string, any>),
+      ...(requestInit.headers as Record<string, any>),
+    };
+
+    let response = await fetch(fullUrl, { ...requestInit, headers });
+
+    // In the browser a 401 normally just means the OIDC access token expired
+    // while the page was open. Renew it and replay the request once, so that
+    // background polling does not throw the user out of the page instead.
+    if (
+      response.status === 401 &&
+      !this.isServer &&
+      this.config?.AUTH_TYPE !== AuthType.OAUTH2PROXY
+    ) {
+      const renewedToken = await this.renewAccessToken();
+      if (renewedToken) {
+        response = await fetch(fullUrl, {
+          ...requestInit,
+          headers: { ...headers, Authorization: `Bearer ${renewedToken}` },
+        });
+      }
+    }
+
     return this.handleResponse(response, url);
+  }
+
+  // Returns a fresh bearer token if the session really was renewed, or null
+  // when there is nothing better to retry with.
+  private async renewAccessToken(): Promise<string | null> {
+    const currentToken = this.session?.accessToken;
+    if (!currentToken || currentToken === "unauthenticated") {
+      return null;
+    }
+    try {
+      const session = await renewSession();
+      const renewedToken = session?.accessToken;
+      // The same token back, or an explicit refresh failure, means the renewal
+      // did not happen - replaying the request would only yield another 401.
+      if (!renewedToken || session?.error || renewedToken === currentToken) {
+        return null;
+      }
+      return renewedToken;
+    } catch (error) {
+      console.error("Error renewing session:", error);
+      return null;
+    }
   }
 
   async get<T = any>(url: string, requestInit: RequestInit = {}) {
