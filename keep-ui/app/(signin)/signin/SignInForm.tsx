@@ -2,7 +2,7 @@
 
 import { signIn, getProviders } from "next-auth/react";
 import { Text, TextInput, Button } from "@tremor/react";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useForm } from "react-hook-form";
 import { authenticate, revalidateAfterAuth } from "@/app/actions/authactions";
 import { useRouter } from "next/navigation";
@@ -23,6 +23,7 @@ export interface Providers {
   "microsoft-entra-id"?: Provider;
   okta?: Provider;
   onelogin?: Provider
+  oidc?: Provider;
 }
 
 interface SignInFormInputs {
@@ -57,9 +58,15 @@ export default function SignInForm({
     fetchProviders();
   }, []);
 
-  useEffect(() => {
-    console.log("Checking providers");
-    console.log("Search params:", searchParams);
+  // Auth.js bounces back to this page with ?error=... when the redirect it
+  // started could not be completed - MissingCSRF, for instance, when the CSRF
+  // cookie did not reach the browser.
+  const authError =
+    typeof searchParams?.error === "string" ? searchParams.error : undefined;
+
+  // Extracted so the retry button below runs exactly what the automatic
+  // redirect runs.
+  const startProviderSignIn = useCallback(() => {
     if (providers) {
       console.log("Providers:", providers);
       if (providers.auth0) {
@@ -85,6 +92,9 @@ export default function SignInForm({
       } else if (providers.onelogin) {
         console.log("Signing in with OneLogin provider");
         signIn("onelogin", { callbackUrl: "/" });
+      } else if (providers.oidc) {
+        console.log("Signing in with generic OIDC provider");
+        signIn("oidc", { callbackUrl: "/" });
       } else if (
         providers.credentials &&
         providers.credentials.name === "OAuth2Proxy"
@@ -124,7 +134,22 @@ export default function SignInForm({
         console.log("No providers found");
       }
     }
-  }, [providers, params, searchParams]);
+  }, [providers, params]);
+
+  useEffect(() => {
+    console.log("Checking providers");
+    console.log("Search params:", searchParams);
+    if (!providers) {
+      return;
+    }
+    if (authError) {
+      // Redirecting again straight away would just repeat whatever failed, so
+      // show the error and let the user decide to retry.
+      console.error("Sign-in failed:", authError);
+      return;
+    }
+    startProviderSignIn();
+  }, [providers, searchParams, authError, startProviderSignIn]);
 
   const onSubmit = async (data: SignInFormInputs) => {
     try {
@@ -181,6 +206,13 @@ export default function SignInForm({
         </Text>
 
         <form className="w-full space-y-6" onSubmit={handleSubmit(onSubmit)}>
+          {authError && !errors.root && (
+            <div className="w-full rounded-md bg-red-50 p-4">
+              <Text className="text-sm text-red-500 text-center">
+                Sign-in failed: {authError}
+              </Text>
+            </div>
+          )}
           {errors.root && (
             <div className="w-full rounded-md bg-red-50 p-4">
               <Text className="text-sm text-red-500 text-center">
@@ -247,6 +279,27 @@ export default function SignInForm({
           </Button>
         </form>
       </>
+    );
+  }
+
+  if (authError) {
+    return (
+      <div className="h-full flex flex-col items-center justify-center gap-4">
+        <Text className="text-tremor-title font-bold text-tremor-content-strong">
+          Sign-in failed
+        </Text>
+        <div className="w-full rounded-md bg-red-50 p-4">
+          <Text className="text-sm text-red-500 text-center">{authError}</Text>
+        </div>
+        <Button
+          size="lg"
+          color="orange"
+          variant="primary"
+          onClick={() => startProviderSignIn()}
+        >
+          Try again
+        </Button>
+      </div>
     );
   }
 

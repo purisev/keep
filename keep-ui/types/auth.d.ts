@@ -6,6 +6,8 @@ declare module "next-auth" {
     accessToken: string;
     tenantId?: string;
     userRole?: string;
+    // "RefreshAccessTokenError" when the access token could not be renewed
+    error?: string;
     user: {
       id: string;
       name: string;
@@ -38,6 +40,9 @@ declare module "next-auth/jwt" {
     accessToken: string;
     tenantId?: string;
     role?: string;
+    refreshToken?: string;
+    accessTokenExpires?: number;
+    error?: string;
     tenantIds?: {
       tenant_id: string;
       tenant_name: string;
