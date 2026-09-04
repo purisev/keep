@@ -7,6 +7,7 @@ import { InternalConfig } from "@/types/internal-config";
 // Mock dependencies
 jest.mock("next-auth/react", () => ({
   signOut: jest.fn(),
+  getSession: jest.fn(),
 }));
 
 jest.mock("@sentry/nextjs", () => ({
@@ -31,6 +32,9 @@ function createMockResponse(
 }
 
 describe("ApiClient", () => {
+  // The page the user is on when the 401 arrives, and the address they are sent
+  // back to once they have signed in again.
+  const currentPage = "http://localhost:3000/incidents";
   let locationHref = "";
 
   const mockSession = {
@@ -49,7 +53,7 @@ describe("ApiClient", () => {
   beforeEach(() => {
     jest.clearAllMocks();
     global.fetch = jest.fn();
-    locationHref = "";
+    locationHref = currentPage;
 
     // Mock window.location.href using Object.defineProperty
     Object.defineProperty(window, "location", {
@@ -87,7 +91,7 @@ describe("ApiClient", () => {
       expect(signOutClient).not.toHaveBeenCalled();
     });
 
-    it("should call NextAuth signOut for DB auth type on 401", async () => {
+    it("should sign out and return to the current page for DB auth type on 401", async () => {
       const client = new ApiClient(mockSession, createConfig(AuthType.DB));
 
       const mockResponse = createMockResponse(
@@ -99,11 +103,13 @@ describe("ApiClient", () => {
         client.handleResponse(mockResponse, "/test-url")
       ).rejects.toThrow();
 
-      expect(signOutClient).toHaveBeenCalled();
-      expect(locationHref).toBe("");
+      expect(signOutClient).toHaveBeenCalledWith({ redirect: false });
+      expect(locationHref).toBe(
+        `/signin?callbackUrl=${encodeURIComponent(currentPage)}`
+      );
     });
 
-    it("should call NextAuth signOut for AUTH0 auth type on 401", async () => {
+    it("should sign out and return to the current page for AUTH0 auth type on 401", async () => {
       const client = new ApiClient(mockSession, createConfig(AuthType.AUTH0));
 
       const mockResponse = createMockResponse(
@@ -115,11 +121,13 @@ describe("ApiClient", () => {
         client.handleResponse(mockResponse, "/test-url")
       ).rejects.toThrow();
 
-      expect(signOutClient).toHaveBeenCalled();
-      expect(locationHref).toBe("");
+      expect(signOutClient).toHaveBeenCalledWith({ redirect: false });
+      expect(locationHref).toBe(
+        `/signin?callbackUrl=${encodeURIComponent(currentPage)}`
+      );
     });
 
-    it("should call NextAuth signOut for KEYCLOAK auth type on 401", async () => {
+    it("should sign out and return to the current page for KEYCLOAK auth type on 401", async () => {
       const client = new ApiClient(mockSession, createConfig(AuthType.KEYCLOAK));
 
       const mockResponse = createMockResponse(
@@ -131,8 +139,10 @@ describe("ApiClient", () => {
         client.handleResponse(mockResponse, "/test-url")
       ).rejects.toThrow();
 
-      expect(signOutClient).toHaveBeenCalled();
-      expect(locationHref).toBe("");
+      expect(signOutClient).toHaveBeenCalledWith({ redirect: false });
+      expect(locationHref).toBe(
+        `/signin?callbackUrl=${encodeURIComponent(currentPage)}`
+      );
     });
 
     it("should not sign out on server side (isServer=true)", async () => {

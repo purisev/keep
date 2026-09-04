@@ -26,7 +26,7 @@ interface ApiClientOptions {
 // polling on alerts, incidents, presets, health) must trigger at most one
 // session renewal and at most one sign-out.
 let sessionRenewal: Promise<Session | null> | null = null;
-let isSigningOut = false;
+let signOutInFlight: Promise<void> | null = null;
 
 function renewSession(): Promise<Session | null> {
   if (!sessionRenewal) {
@@ -43,11 +43,16 @@ function renewSession(): Promise<Session | null> {
 // and drops the user wherever the default redirect points - losing the filters,
 // scroll position and open dialogs of the page they were working on. Sign out
 // without that redirect and send them back to the same URL after logging in.
-async function signOutAndReturn() {
-  if (isSigningOut) {
-    return;
+function signOutAndReturn(): Promise<void> {
+  if (!signOutInFlight) {
+    signOutInFlight = runSignOut().finally(() => {
+      signOutInFlight = null;
+    });
   }
-  isSigningOut = true;
+  return signOutInFlight;
+}
+
+async function runSignOut() {
   const callbackUrl = window.location.href;
   try {
     await signOutClient({ redirect: false });
