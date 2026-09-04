@@ -21,8 +21,13 @@ logging.basicConfig(level=logging.DEBUG)
 
 
 API_KEY_HEADERS = {"x-api-key": "some-api-key"}
-POLL_TIMEOUT = 30
+# below both the per-test timeouts in this file and the suite-wide one, so a
+# condition that never settles fails with its own assertion rather than being
+# killed from outside
+POLL_TIMEOUT = 10
 POLL_INTERVAL = 0.1
+# gap between a deduplication event being recorded and the alert being written
+WRITE_SETTLE = 0.3
 
 
 def poll_until(fetch, settled, timeout=POLL_TIMEOUT):
@@ -61,6 +66,32 @@ def wait_for_deduplication_rules(client, settled, timeout=POLL_TIMEOUT):
     return poll_until(lambda: get_deduplication_rules(client), settled, timeout)
 
 
+def post_alerts(client, provider_type, alerts):
+    """Post alerts one at a time, each ingested before the next is sent.
+
+    A deduplication decision is made against what is already stored, so tests
+    that expect one alert to deduplicate another need that order to be real.
+    Each ingested alert records exactly one deduplication event, which makes the
+    total across the rules the progress counter to wait on - and it is recorded
+    just before the alert itself is written, hence the settle after it.
+    """
+    ingested_before = sum(
+        rule.get("ingested", 0) for rule in get_deduplication_rules(client)
+    )
+    for processed, alert in enumerate(alerts, start=1):
+        client.post(
+            f"/alerts/event/{provider_type}", json=alert, headers=API_KEY_HEADERS
+        )
+        wait_for_deduplication_rules(
+            client,
+            lambda rules, n=ingested_before + processed: sum(
+                rule.get("ingested", 0) for rule in rules
+            )
+            >= n,
+        )
+        time.sleep(WRITE_SETTLE)
+
+
 def rule_named(rules, name):
     return next((rule for rule in rules if rule.get("name") == name), {})
 
@@ -92,13 +123,7 @@ def test_default_deduplication_rule(db_session, client, test_app):
         for provider in ["datadog", "prometheus"]
     }
     for provider_type, provider in provider_classes.items():
-        alert = provider.simulate_alert()
-        client.post(
-            f"/alerts/event/{provider_type}?",
-            json=alert,
-            headers={"x-api-key": "some-api-key"},
-        )
-        time.sleep(0.1)
+        post_alerts(client, provider_type, [provider.simulate_alert()])
 
     wait_for_alerts(client, 2)
 
@@ -143,11 +168,7 @@ def test_deduplication_sanity(db_session, client, test_app):
     # insert an alert with some provider_id and make sure that the default deduplication rule is working
     provider = ProvidersFactory.get_provider_class("datadog")
     alert = provider.simulate_alert()
-    for i in range(2):
-        client.post(
-            "/alerts/event/datadog", json=alert, headers={"x-api-key": "some-api-key"}
-        )
-        time.sleep(0.1)
+    post_alerts(client, "datadog", [alert, alert])
 
     wait_for_alerts(client, 1)
 
@@ -189,14 +210,7 @@ def test_deduplication_sanity_2(db_session, client, test_app):
     while alert2.get("monitor_id") == alert1.get("monitor_id"):
         alert2 = provider.simulate_alert()
 
-    for alert in [alert1, alert2]:
-        for _ in range(2):
-            client.post(
-                "/alerts/event/datadog",
-                json=alert,
-                headers={"x-api-key": "some-api-key"},
-            )
-            time.sleep(0.1)
+    post_alerts(client, "datadog", [alert1, alert1, alert2, alert2])
 
     wait_for_alerts(client, 2)
 
@@ -234,10 +248,7 @@ def test_deduplication_sanity_3(db_session, client, test_app):
         while alert["monitor_id"] in monitor_ids:
             alert["monitor_id"] = random.randint(0, 10**10)
         monitor_ids.add(alert["monitor_id"])
-        client.post(
-            "/alerts/event/datadog", json=alert, headers={"x-api-key": "some-api-key"}
-        )
-        time.sleep(0.1)
+    post_alerts(client, "datadog", alerts)
 
     wait_for_alerts(client, 10)
 
@@ -291,12 +302,8 @@ def test_custom_deduplication_rule(db_session, client, test_app):
     provider = ProvidersFactory.get_provider_class("datadog")
     alert = provider.simulate_alert()
 
-    for _ in range(2):
-        # shoot two alerts with the same title and message, dedup should be 50%
-        client.post(
-            "/alerts/event/datadog", json=alert, headers={"x-api-key": "some-api-key"}
-        )
-        time.sleep(0.3)
+    # shoot two alerts with the same title and message, dedup should be 50%
+    post_alerts(client, "datadog", [alert, alert])
 
     deduplication_rules = wait_for_deduplication_rules(
         client, lambda rules: rule_named(rules, "Custom Rule").get("ingested") == 2
@@ -350,14 +357,16 @@ def test_custom_deduplication_rule_behaviour(db_session, client, test_app):
     provider = ProvidersFactory.get_provider_class("datadog")
     alert = provider.simulate_alert()
 
-    for _ in range(2):
-        # the default rule should deduplicate the alert by monitor_id so let's randomize it -
-        # if the custom rule is working, the alert should be deduplicated by title and message
-        alert["monitor_id"] = random.randint(0, 10**10)
-        client.post(
-            "/alerts/event/datadog", json=alert, headers={"x-api-key": "some-api-key"}
-        )
-        time.sleep(0.3)
+    # the default rule should deduplicate the alert by monitor_id so let's randomize it -
+    # if the custom rule is working, the alert should be deduplicated by title and message
+    post_alerts(
+        client,
+        "datadog",
+        [
+            {**alert, "monitor_id": random.randint(0, 10**10)},
+            {**alert, "monitor_id": random.randint(0, 10**10)},
+        ],
+    )
 
     deduplication_rules = wait_for_deduplication_rules(
         client, lambda rules: rule_named(rules, "Custom Rule").get("ingested") == 2
@@ -414,16 +423,10 @@ def test_custom_deduplication_rule_2(db_session, client, test_app):
     provider = ProvidersFactory.get_provider_class("datadog")
     alert1 = provider.simulate_alert()
 
-    client.post(
-        f"/alerts/event/datadog?provider_id={datadog_provider_id}",
-        json=alert1,
-        headers={"x-api-key": "some-api-key"},
-    )
-    alert1["title"] = "Different title"
-    client.post(
-        f"/alerts/event/datadog?provider_id={datadog_provider_id}",
-        json=alert1,
-        headers={"x-api-key": "some-api-key"},
+    post_alerts(
+        client,
+        f"datadog?provider_id={datadog_provider_id}",
+        [alert1, {**alert1, "title": "Different title"}],
     )
 
     wait_for_alerts(client, 2)
@@ -707,10 +710,7 @@ def test_full_deduplication(db_session, client, test_app):
     )
     assert response.status_code == 200
 
-    for _ in range(3):
-        client.post(
-            "/alerts/event/datadog", json=alert, headers={"x-api-key": "some-api-key"}
-        )
+    post_alerts(client, "datadog", [alert, alert, alert])
 
     deduplication_rules = client.get(
         "/deduplications", headers={"x-api-key": "some-api-key"}
@@ -747,11 +747,7 @@ def test_partial_deduplication(db_session, client, test_app):
         {**base_alert, "source": "Different source"},
     ]
 
-    for alert in alerts:
-        client.post(
-            "/alerts/event/datadog", json=alert, headers={"x-api-key": "some-api-key"}
-        )
-        time.sleep(0.2)
+    post_alerts(client, "datadog", alerts)
 
     wait_for_alerts(client, 1)
 
@@ -830,10 +826,7 @@ def test_deduplication_fields(db_session, client, test_app):
         {**base_alert, "title": "Different title"},
     ]
 
-    for alert in alerts:
-        client.post(
-            "/alerts/event/datadog", json=alert, headers={"x-api-key": "some-api-key"}
-        )
+    post_alerts(client, "datadog", alerts)
 
     wait_for_alerts(client, 1)
 
@@ -976,20 +969,7 @@ def test_sort_keys_deduplication_fix(db_session, client, test_app):
         "fingerprint": fingerprint  # Same fingerprint
     }
 
-    # Send both alerts to prometheus provider
-    client.post(
-        "/alerts/event/prometheus",
-        json=base_alert,
-        headers={"x-api-key": "some-api-key"}
-    )
-    time.sleep(0.1)
-
-    client.post(
-        "/alerts/event/prometheus",
-        json=reordered_alert,
-        headers={"x-api-key": "some-api-key"}
-    )
-    time.sleep(0.1)
+    post_alerts(client, "prometheus", [base_alert, reordered_alert])
 
     # Should only have 1 alert because they should be deduplicated
     wait_for_alerts(client, 1)
