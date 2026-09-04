@@ -15,7 +15,6 @@ from dotenv import find_dotenv, load_dotenv
 from pytest_docker.plugin import get_docker_services
 from sqlalchemy import event, text
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 from starlette_context import context, request_cycle_context
 from playwright.sync_api import Page
@@ -232,26 +231,32 @@ def db_session(request, monkeypatch, tmp_path):
         mock_engine = create_engine(db_connection_string)
     # sqlite
     else:
-        db_connection_string = "sqlite:///:memory:"
+        # A file, not ":memory:": alert ingestion runs in background threads,
+        # and every connection to an in-memory database is a database of its
+        # own, so sharing one connection between those threads is the only way
+        # to share the data - which sqlite answers with "bad parameter or other
+        # API misuse" the moment two of them commit at once. On a file each
+        # thread opens its own connection, WAL keeps readers off the writers'
+        # backs, and a writer that meets another one waits out the busy
+        # timeout instead of failing.
+        db_connection_string = f"sqlite:///{tmp_path}/keep.db"
         mock_engine = create_engine(
             db_connection_string,
-            connect_args={"check_same_thread": False},
-            poolclass=StaticPool,
+            connect_args={"check_same_thread": False, "timeout": 30},
         )
 
-        # @tb: leaving this here if anybody else gets to problem with nested transactions
-        # https://docs.sqlalchemy.org/en/20/dialects/sqlite.html#serializable-isolation-savepoints-transactional-ddl
         @event.listens_for(mock_engine, "connect")
         def do_connect(dbapi_connection, connection_record):
             # disable pysqlite's emitting of the BEGIN statement entirely.
             # also stops it from emitting COMMIT before any DDL.
             dbapi_connection.isolation_level = None
+            dbapi_connection.execute("PRAGMA journal_mode=WAL")
 
         @event.listens_for(mock_engine, "begin")
         def do_begin(conn):
             # emit our own BEGIN
             try:
-                conn.exec_driver_sql(text("BEGIN EXCLUSIVE"))
+                conn.exec_driver_sql(text("BEGIN"))
             except Exception:
                 pass
 
