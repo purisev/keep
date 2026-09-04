@@ -16,9 +16,14 @@ export function getConfig(): InternalConfig {
     authType = AuthType.DB;
   } else if (authType === NO_AUTH) {
     authType = AuthType.NOAUTH;
-  } else if (Object.values(AuthType).includes(authType as AuthType)) {
-    // Keep the auth type if it's a valid enum value
-    authType = authType as AuthType;
+  } else if (
+    Object.values(AuthType).includes(authType?.toUpperCase() as AuthType)
+  ) {
+    // Keep the auth type if it's a valid enum value. Upper-cased because the
+    // backend spells the generic OIDC manager "oidc", and this value is
+    // compared against the enum on the client (ApiClient, useSignOut, the
+    // settings pages).
+    authType = authType!.toUpperCase() as AuthType;
   } else {
     // Default to NOAUTH
     authType = AuthType.NOAUTH;
