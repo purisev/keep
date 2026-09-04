@@ -32,6 +32,7 @@ from keep.api.core.db import (
     get_session_sync,
     get_started_at_for_alerts,
     set_last_alert,
+    update_last_alert_work_item_keys,
 )
 from keep.api.core.dependencies import get_pusher_client
 from keep.api.core.elastic import ElasticClient
@@ -176,6 +177,18 @@ def __save_to_db(
                     action_callee="system",
                     action_description="Alert lastReceived enriched on deduplication",
                 )
+
+        # a deduplicated occurrence still gets a say in which work item its
+        # alert belongs to
+        if deduplicated_events:
+            update_last_alert_work_item_keys(
+                tenant_id,
+                {
+                    event.fingerprint: event.work_item_key
+                    for event in deduplicated_events
+                },
+                session=session,
+            )
 
         enriched_formatted_events = []
         saved_alerts = []

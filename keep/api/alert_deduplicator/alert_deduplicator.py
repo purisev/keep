@@ -16,6 +16,7 @@ from keep.api.core.db import (
     get_all_deduplication_stats,
     get_custom_deduplication_rule,
     get_deduplication_rule_by_id,
+    get_deduplication_rule_by_type,
     get_last_alert_hashes_by_fingerprints,
     update_deduplication_rule,
 )
@@ -27,6 +28,9 @@ from keep.api.models.alert import (
 from keep.providers.providers_factory import ProvidersFactory
 
 DEFAULT_RULE_UUID = "00000000-0000-0000-0000-000000000000"
+# Derived at ingestion rather than sent by the tool: they describe which work
+# item an alert belongs to, never what the alert says.
+DERIVED_FIELDS_EXCLUDED_FROM_HASH = ("work_item_key", "alert_group")
 
 
 class AlertDeduplicator:
@@ -64,8 +68,13 @@ class AlertDeduplicator:
             alert_copy = self._remove_field(field, alert_copy)
 
         # calculate the hash
+        alert_payload = alert_copy.dict()
+        # work item metadata stays out of the hash, so a correlate rule is not
+        # observable in deduplication behaviour
+        for derived_field in DERIVED_FIELDS_EXCLUDED_FROM_HASH:
+            alert_payload.pop(derived_field, None)
         alert_hash = hashlib.sha256(
-            json.dumps(alert_copy.dict(), default=str, sort_keys=True).encode()
+            json.dumps(alert_payload, default=str, sort_keys=True).encode()
         ).hexdigest()
         alert.alert_hash = alert_hash
         # Check if the hash is already in the database.
@@ -335,6 +344,7 @@ class AlertDeduplicator:
                 dedup_ratio=0.0,
                 enabled=rule.enabled,
                 is_provisioned=rule.is_provisioned,
+                rule_type=rule.rule_type,
             )
             for rule in custom_deduplications
         ]
@@ -502,6 +512,22 @@ class AlertDeduplicator:
                 detail=message,
             )
 
+        # A provider gets at most one rule of each type: with two, the
+        # fingerprint - or the work item key - would depend on which row the
+        # query returned first.
+        existing_rule = get_deduplication_rule_by_type(
+            self.tenant_id, rule.provider_id, rule.provider_type, rule.rule_type
+        )
+        if existing_rule:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"A {rule.rule_type.value} deduplication rule already exists "
+                    f"for this provider ({existing_rule.name}). Update it instead "
+                    "of creating a second one."
+                ),
+            )
+
         # Use the db function to create a new deduplication rule
         new_rule = create_deduplication_rule(
             tenant_id=self.tenant_id,
@@ -515,6 +541,7 @@ class AlertDeduplicator:
             full_deduplication=rule.full_deduplication,
             ignore_fields=rule.ignore_fields or [],
             priority=0,
+            rule_type=rule.rule_type,
         )
 
         return new_rule
@@ -572,6 +599,7 @@ class AlertDeduplicator:
             full_deduplication=rule.full_deduplication,
             ignore_fields=rule.ignore_fields or [],
             priority=0,
+            rule_type=rule.rule_type,
         )
 
         return updated_rule
