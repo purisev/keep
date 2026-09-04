@@ -8,6 +8,9 @@ export enum AuthType {
   AZUREAD = "AZUREAD",
   OKTA = "OKTA",
   ONELOGIN = "ONELOGIN",
+  // Generic OpenID Connect, matching AUTH_TYPE=oidc on the backend
+  // (keep/identitymanager/identity_managers/oidc).
+  OIDC = "OIDC",
   NOAUTH = "NOAUTH", // Default
 }
 

@@ -105,6 +105,42 @@ where the resource may be `*`. The built-in roles `admin`, `noc`, `webhook` and
 | `KEEP_RESOURCE_PERMISSIONS_MAX_SCAN` | `10000` | Upper bound on rows **returned** per rule. For incidents this bounds matched rows (the filtering happens in SQL); for presets it bounds fetched rows. Hitting it is logged as an error, and it hides data rather than exposing it. |
 | `KEEP_RESOURCE_PERMISSIONS_CACHE_TTL` | `15` | Seconds a resolved allowed-ID set is reused. `0` disables the cache. See [Caching](#caching). |
 
+## Frontend (keep-ui)
+
+The frontend is a separate service with its own environment, and it needs the
+OIDC settings too: it is what runs the browser-facing authorization code flow
+and puts the bearer token on every API call. Set `AUTH_TYPE=oidc` on both
+containers. When the frontend does not recognise its `AUTH_TYPE` it now refuses
+to start, rather than quietly falling back to the no-auth provider.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `KEEP_OIDC_ISSUER` | — | Same value as the backend. Auth.js discovers the authorization and token endpoints from it. |
+| `KEEP_OIDC_CLIENT_ID` | — | Client the frontend authenticates as. |
+| `KEEP_OIDC_CLIENT_SECRET` | — | Its secret. |
+| `KEEP_OIDC_SCOPES` | `openid email profile` | Requested scopes. `offline_access` is appended automatically. |
+| `KEEP_OIDC_BEARER_TOKEN` | `access_token` | Which token is sent to the backend as the bearer: `access_token` or `id_token`. Must agree with `KEEP_OIDC_AUDIENCE`, since `aud` differs between the two. |
+| `KEEP_OIDC_DISPLAY_NAME` | `SSO` | Button label on the sign-in page. |
+| `KEEP_OIDC_TOKEN_AUTH_METHOD` | `client_secret_post` | Token endpoint client authentication method. |
+| `KEEP_OIDC_TOKEN_URL` | — | Skip discovery for the refresh grant and use this token endpoint. |
+| `AUTH_DISABLE_OFFLINE_ACCESS` | — | `true` stops the frontend requesting `offline_access`. Only for IdPs that reject the scope; without a refresh token the session ends when the access token expires. |
+
+`KEEP_OIDC_EMAIL_CLAIM`, `KEEP_OIDC_TENANT_CLAIM`, `KEEP_OIDC_GROUPS_CLAIM`,
+`KEEP_OIDC_ROLE_CLAIM`, `KEEP_OIDC_ROLE_MAPPINGS` and `KEEP_OIDC_DEFAULT_ROLE`
+are read by the frontend as well, with the same meaning, so one set of variables
+describes both halves. Two differences:
+
+* `KEEP_OIDC_ROLE_MAPPINGS_FILE` is backend-only. The frontend evaluates this in
+  the Edge runtime, where there is no filesystem; use the inline JSON form.
+* `KEEP_OIDC_ROLE_COMPOSITION=union` is backend-only. The frontend resolves the
+  first matching mapping and uses it to decide which pages to show. What a user
+  can actually read is decided by the backend, which composes the role itself.
+
+The frontend renews the access token through the refresh grant shortly before it
+expires, and re-reads the session every five minutes so an open tab keeps a live
+token. If a renewal fails, the next API call that gets a 401 signs the user out
+and returns them to the page they were on.
+
 ## Resource permission rules
 
 A rule says "role R may see resources of type T whose attributes match M".
