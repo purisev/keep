@@ -15,7 +15,7 @@ from uuid import UUID, uuid4
 # from pydantic import BaseModel
 from sqlmodel import Session
 
-from keep.api.core.db import engine
+from keep.api.core import db as core_db
 from keep.api.models.db.facet import Facet, FacetType
 
 logger = logging.getLogger(__name__)
@@ -85,7 +85,7 @@ def get_facet_options(
     result_dict: dict[str, list[FacetOptionDto]] = {}
 
     if valid_facets:
-        with Session(engine) as session:
+        with Session(core_db.engine) as session:
             try:
                 db_query = get_facets_query_builder(
                     properties_metadata
@@ -115,7 +115,7 @@ def get_facet_options(
                 # This is to limit the number of options per facet
                 # It's done mostly for sqlite, because in sqlite we can't use limit in the subquery
                 if (
-                    engine.dialect.name == "sqlite"
+                    core_db.engine.dialect.name == "sqlite"
                     and len(grouped_by_id_dict[facet_data.facet_id])
                     >= OPTIONS_PER_FACET
                 ):
@@ -201,7 +201,7 @@ def create_facet(tenant_id: str, entity_type, facet: CreateFacetDto) -> FacetDto
         FacetDto: The data transfer object containing the details of the created facet.
     """
 
-    with Session(engine) as session:
+    with Session(core_db.engine) as session:
         facet_db = Facet(
             id=str(uuid4()),
             tenant_id=tenant_id,
@@ -237,7 +237,7 @@ def delete_facet(tenant_id: str, entity_type: str, facet_id: str) -> bool:
     Returns:
         bool: True if the facet was successfully deleted, False otherwise.
     """
-    with Session(engine) as session:
+    with Session(core_db.engine) as session:
         facet = session.exec(
             select(Facet)
             .where(Facet.tenant_id == tenant_id)
@@ -265,7 +265,7 @@ def get_facets(
     Returns:
         list[FacetDto]: A list of FacetDto objects representing the facets.
     """
-    with Session(engine) as session:
+    with Session(core_db.engine) as session:
         query = select(Facet).where(
             Facet.tenant_id == tenant_id,
             Facet.entity_type == entity_type

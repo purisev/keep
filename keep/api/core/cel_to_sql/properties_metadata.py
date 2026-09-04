@@ -24,11 +24,13 @@ class PropertyMetadataInfo:
         field_mappings: list[SimpleFieldMapping | JsonFieldMapping],
         enum_values: list[str],
         data_type: DataType = None,
+        enum_int_values: dict[str, int] = None,
     ):
         self.field_name = field_name
         self.field_mappings = field_mappings
         self.enum_values = enum_values
         self.data_type = data_type
+        self.enum_int_values = enum_int_values
 
 
 class FieldMappingConfiguration:
@@ -39,10 +41,22 @@ class FieldMappingConfiguration:
         map_to: list[str] | str,
         data_type: DataType = None,
         enum_values: list[str] = None,
+        enum_int_values: dict[str, int] = None,
     ):
+        """
+        enum_int_values: for a column that stores an ordered enum as an
+        integer (e.g. incident.severity), rather than as its string label
+        (contrast with enum_values, used when the label itself is what's
+        stored). Maps {label: underlying int}; a comparison against one of
+        these labels has its constant rewritten to the int before SQL
+        generation, so EQ/NE/GE/GT/LE/LT all compare against the real column
+        type directly -- no IN-based reindexing needed, since real integers
+        already sort correctly.
+        """
         self.map_from_pattern = map_from_pattern
         self.enum_values = enum_values
         self.data_type = data_type
+        self.enum_int_values = enum_int_values
         self.map_to: list[str] = map_to if isinstance(map_to, list) else [map_to]
 
 
@@ -65,6 +79,7 @@ def remap_fields_configurations(
             map_to=item.map_to,
             enum_values=item.enum_values,
             data_type=item.data_type,
+            enum_int_values=item.enum_int_values,
         )
         for item in field_configurations
     ]
@@ -103,6 +118,7 @@ class PropertiesMetadata:
                 map_to=field_mapping.map_to,
                 data_type=field_mapping.data_type,
                 enum_values=field_mapping.enum_values,
+                enum_int_values=field_mapping.enum_int_values,
             )
 
             if '*' in field_mapping.map_from_pattern:
@@ -178,6 +194,7 @@ class PropertiesMetadata:
             field_mappings=field_mappings,
             enum_values=field_mapping_config.enum_values,
             data_type=field_mapping_config.data_type,
+            enum_int_values=field_mapping_config.enum_int_values,
         )
 
     def __extract_fields(self, property_path_str):
