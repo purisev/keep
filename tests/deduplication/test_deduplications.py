@@ -20,13 +20,60 @@ from tests.fixtures.client import client, setup_api_key, test_app  # noqa
 logging.basicConfig(level=logging.DEBUG)
 
 
-def wait_for_alerts(client, num_alerts):
-    alerts = client.get("/alerts", headers={"x-api-key": "some-api-key"}).json()
-    print(f"------------- Total alerts: {len(alerts)}")
-    while len(alerts) != num_alerts:
-        time.sleep(1)
-        alerts = client.get("/alerts", headers={"x-api-key": "some-api-key"}).json()
-        print(f"------------- Total alerts: {len(alerts)}")
+API_KEY_HEADERS = {"x-api-key": "some-api-key"}
+POLL_TIMEOUT = 30
+POLL_INTERVAL = 0.1
+
+
+def poll_until(fetch, settled, timeout=POLL_TIMEOUT):
+    """Poll `fetch` until `settled` holds, and return the last value either way.
+
+    Ingestion runs in a background thread and writes alerts and deduplication
+    statistics in separate transactions, so a test has to wait for the quantity
+    it asserts on. Returning the last value on timeout keeps the failure
+    message about the state the test saw.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        value = fetch()
+        if settled(value) or time.monotonic() >= deadline:
+            return value
+        time.sleep(POLL_INTERVAL)
+
+
+def get_alerts(client):
+    return client.get("/alerts", headers=API_KEY_HEADERS).json()
+
+
+def get_deduplication_rules(client):
+    return client.get("/deduplications", headers=API_KEY_HEADERS).json()
+
+
+def wait_for_alerts(client, num_alerts, timeout=POLL_TIMEOUT):
+    alerts = poll_until(
+        lambda: get_alerts(client), lambda a: len(a) == num_alerts, timeout
+    )
+    assert len(alerts) == num_alerts
+    return alerts
+
+
+def wait_for_deduplication_rules(client, settled, timeout=POLL_TIMEOUT):
+    return poll_until(lambda: get_deduplication_rules(client), settled, timeout)
+
+
+def rule_named(rules, name):
+    return next((rule for rule in rules if rule.get("name") == name), {})
+
+
+def default_rule_of(rules, provider_type):
+    return next(
+        (
+            rule
+            for rule in rules
+            if rule.get("provider_type") == provider_type and rule.get("default")
+        ),
+        {},
+    )
 
 
 @pytest.mark.parametrize(
@@ -55,9 +102,13 @@ def test_default_deduplication_rule(db_session, client, test_app):
 
     wait_for_alerts(client, 2)
 
-    deduplication_rules = client.get(
-        "/deduplications", headers={"x-api-key": "some-api-key"}
-    ).json()
+    deduplication_rules = wait_for_deduplication_rules(
+        client,
+        lambda rules: all(
+            default_rule_of(rules, provider_type).get("ingested") == 1
+            for provider_type in provider_classes
+        ),
+    )
     assert len(deduplication_rules) == 3  # default + datadog + prometheus
 
     for dedup_rule in deduplication_rules:
@@ -100,16 +151,9 @@ def test_deduplication_sanity(db_session, client, test_app):
 
     wait_for_alerts(client, 1)
 
-    deduplication_rules = client.get(
-        "/deduplications", headers={"x-api-key": "some-api-key"}
-    ).json()
-    while not any(
-        [rule for rule in deduplication_rules if rule.get("dedup_ratio") == 50.0]
-    ):
-        time.sleep(0.1)
-        deduplication_rules = client.get(
-            "/deduplications", headers={"x-api-key": "some-api-key"}
-        ).json()
+    deduplication_rules = wait_for_deduplication_rules(
+        client, lambda rules: default_rule_of(rules, "datadog").get("ingested") == 2
+    )
 
     assert len(deduplication_rules) == 2  # default + datadog
 
@@ -156,17 +200,9 @@ def test_deduplication_sanity_2(db_session, client, test_app):
 
     wait_for_alerts(client, 2)
 
-    deduplication_rules = client.get(
-        "/deduplications", headers={"x-api-key": "some-api-key"}
-    ).json()
-
-    while not any(
-        [rule for rule in deduplication_rules if rule.get("dedup_ratio") == 50.0]
-    ):
-        time.sleep(0.1)
-        deduplication_rules = client.get(
-            "/deduplications", headers={"x-api-key": "some-api-key"}
-        ).json()
+    deduplication_rules = wait_for_deduplication_rules(
+        client, lambda rules: default_rule_of(rules, "datadog").get("ingested") == 4
+    )
 
     assert len(deduplication_rules) == 2  # default + datadog
 
@@ -205,9 +241,9 @@ def test_deduplication_sanity_3(db_session, client, test_app):
 
     wait_for_alerts(client, 10)
 
-    deduplication_rules = client.get(
-        "/deduplications", headers={"x-api-key": "some-api-key"}
-    ).json()
+    deduplication_rules = wait_for_deduplication_rules(
+        client, lambda rules: default_rule_of(rules, "datadog").get("ingested") == 10
+    )
 
     assert len(deduplication_rules) == 2  # default + datadog
 
@@ -262,17 +298,9 @@ def test_custom_deduplication_rule(db_session, client, test_app):
         )
         time.sleep(0.3)
 
-    deduplication_rules = client.get(
-        "/deduplications", headers={"x-api-key": "some-api-key"}
-    ).json()
-
-    while not any(
-        [rule for rule in deduplication_rules if rule.get("dedup_ratio") == 50.0]
-    ):
-        time.sleep(0.1)
-        deduplication_rules = client.get(
-            "/deduplications", headers={"x-api-key": "some-api-key"}
-        ).json()
+    deduplication_rules = wait_for_deduplication_rules(
+        client, lambda rules: rule_named(rules, "Custom Rule").get("ingested") == 2
+    )
 
     custom_rule_found = False
     for dedup_rule in deduplication_rules:
@@ -331,17 +359,9 @@ def test_custom_deduplication_rule_behaviour(db_session, client, test_app):
         )
         time.sleep(0.3)
 
-    deduplication_rules = client.get(
-        "/deduplications", headers={"x-api-key": "some-api-key"}
-    ).json()
-
-    while not any(
-        [rule for rule in deduplication_rules if rule.get("dedup_ratio") == 50.0]
-    ):
-        time.sleep(1)
-        deduplication_rules = client.get(
-            "/deduplications", headers={"x-api-key": "some-api-key"}
-        ).json()
+    deduplication_rules = wait_for_deduplication_rules(
+        client, lambda rules: rule_named(rules, "Custom Rule").get("ingested") == 2
+    )
 
     custom_rule_found = False
     for dedup_rule in deduplication_rules:
@@ -406,15 +426,11 @@ def test_custom_deduplication_rule_2(db_session, client, test_app):
         headers={"x-api-key": "some-api-key"},
     )
 
-    # wait for the background tasks to finish
-    alerts = client.get("/alerts", headers={"x-api-key": "some-api-key"}).json()
-    while len(alerts) < 2:
-        time.sleep(1)
-        alerts = client.get("/alerts", headers={"x-api-key": "some-api-key"}).json()
+    wait_for_alerts(client, 2)
 
-    deduplication_rules = client.get(
-        "/deduplications", headers={"x-api-key": "some-api-key"}
-    ).json()
+    deduplication_rules = wait_for_deduplication_rules(
+        client, lambda rules: rule_named(rules, "Custom Rule").get("ingested") == 2
+    )
 
     custom_rule_found = False
     for dedup_rule in deduplication_rules:
@@ -536,7 +552,7 @@ def test_update_deduplication_rule_linked_provider(db_session, client, test_app)
         "/alerts/event/datadog", json=alert1, headers={"x-api-key": "some-api-key"}
     )
 
-    time.sleep(2)
+    wait_for_alerts(client, 1)
     custom_rule = {
         "name": "Custom Rule",
         "description": "Custom Rule Description",
@@ -639,10 +655,7 @@ def test_delete_deduplication_rule_default(db_session, client, test_app):
         "/alerts/event/datadog", json=alert, headers={"x-api-key": "some-api-key"}
     )
 
-    alerts = client.get("/alerts", headers={"x-api-key": "some-api-key"}).json()
-    while len(alerts) != 1:
-        time.sleep(1)
-        alerts = client.get("/alerts", headers={"x-api-key": "some-api-key"}).json()
+    wait_for_alerts(client, 1)
 
     # try to delete a default deduplication rule
     deduplication_rules = client.get(
@@ -742,15 +755,9 @@ def test_partial_deduplication(db_session, client, test_app):
 
     wait_for_alerts(client, 1)
 
-    deduplication_rules = client.get(
-        "/deduplications", headers={"x-api-key": "some-api-key"}
-    ).json()
-
-    while not any([rule for rule in deduplication_rules if rule.get("ingested") == 3]):
-        time.sleep(1)
-        deduplication_rules = client.get(
-            "/deduplications", headers={"x-api-key": "some-api-key"}
-        ).json()
+    deduplication_rules = wait_for_deduplication_rules(
+        client, lambda rules: default_rule_of(rules, "datadog").get("ingested") == 3
+    )
 
     datadog_rule_found = False
     for dedup_rule in deduplication_rules:
@@ -830,16 +837,9 @@ def test_deduplication_fields(db_session, client, test_app):
 
     wait_for_alerts(client, 1)
 
-    deduplication_rules = client.get(
-        "/deduplications", headers={"x-api-key": "some-api-key"}
-    ).json()
-
-    while not any([rule for rule in deduplication_rules if rule.get("ingested") == 3]):
-        print("Waiting for deduplication rules to be ingested")
-        time.sleep(1)
-        deduplication_rules = client.get(
-            "/deduplications", headers={"x-api-key": "some-api-key"}
-        ).json()
+    deduplication_rules = wait_for_deduplication_rules(
+        client, lambda rules: default_rule_of(rules, "datadog").get("ingested") == 3
+    )
 
     datadog_rule_found = False
     for dedup_rule in deduplication_rules:
@@ -994,19 +994,10 @@ def test_sort_keys_deduplication_fix(db_session, client, test_app):
     # Should only have 1 alert because they should be deduplicated
     wait_for_alerts(client, 1)
 
-    # Check deduplication rules to verify deduplication occurred
-    deduplication_rules = client.get(
-        "/deduplications", headers={"x-api-key": "some-api-key"}
-    ).json()
-
-    # Wait for deduplication ratio to be calculated
-    while not any(
-        [rule for rule in deduplication_rules if rule.get("dedup_ratio", 0) > 0]
-    ):
-        time.sleep(0.1)
-        deduplication_rules = client.get(
-            "/deduplications", headers={"x-api-key": "some-api-key"}
-        ).json()
+    deduplication_rules = wait_for_deduplication_rules(
+        client,
+        lambda rules: default_rule_of(rules, "prometheus").get("dedup_ratio", 0) > 0,
+    )
 
     # Find the prometheus deduplication rule
     prometheus_rule = None
