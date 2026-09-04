@@ -37,12 +37,61 @@ def get_fingerprint(fingerprint, values):
     return fingerprint
 
 
+# Work item keys live in a VARCHAR(255) column. A longer key (an Alertmanager
+# groupKey listing many labels, say) is replaced by a digest of itself, so keys
+# sharing a 255 character prefix stay distinct.
+WORK_ITEM_KEY_MAX_LENGTH = 255
+
+
+def normalize_work_item_key(work_item_key: str | None) -> str | None:
+    if work_item_key is None:
+        return None
+    work_item_key = str(work_item_key)
+    if not work_item_key:
+        return None
+    if len(work_item_key) <= WORK_ITEM_KEY_MAX_LENGTH:
+        return work_item_key
+    return hashlib.sha256(work_item_key.encode()).hexdigest()
+
+
 class AlertSeverity(SeverityBaseInterface):
     CRITICAL = ("critical", 5)
     HIGH = ("high", 4)
     WARNING = ("warning", 3)
     INFO = ("info", 2)
     LOW = ("low", 1)
+
+
+class DeduplicationRuleType(str, Enum):
+    """What a deduplication rule computes.
+
+    SPLIT computes the alert fingerprint. CORRELATE computes the work item key,
+    the identity shared by every alert of one unit of work, and leaves the
+    fingerprint alone.
+    """
+
+    SPLIT = "split"
+    CORRELATE = "correlate"
+
+
+class AlertGroupDto(BaseModel):
+    """The grouping the source tool decided before it notified Keep.
+
+    Alertmanager batches alerts by `group_by` and sends one webhook per group;
+    this is that group, carried through ingestion.
+    """
+
+    key: str | None = None  # the source's own group identifier, verbatim
+    labels: dict = {}  # the labels the group was formed on
+    common_labels: dict = {}
+    common_annotations: dict = {}
+    receiver: str | None = None
+    external_url: str | None = None
+    size: int | None = None  # how many alerts the source sent in this group
+    truncated: int = 0  # how many it dropped before sending
+
+    class Config:
+        extra = Extra.allow
 
 
 class AlertStatus(Enum):
@@ -100,6 +149,13 @@ class AlertDto(BaseModel):
     fingerprint: str | None = (
         None  # The fingerprint of the alert (used for alert de-duplication)
     )
+    # Which unit of work this alert belongs to: the Alertmanager group, the
+    # source's dedup_key, or the key a "correlate" deduplication rule computes.
+    # `fingerprint` says which alert this is, `work_item_key` which unit of work
+    # it is part of. Derived at ingestion, excluded from the deduplication hash.
+    work_item_key: str | None = None
+    # The grouping envelope the source sent, as-is.
+    alert_group: AlertGroupDto | None = None
     deleted: bool = (
         False  # @tal: Obselete field since we have dismissed, but kept for backwards compatibility
     )
@@ -148,6 +204,10 @@ class AlertDto(BaseModel):
     @validator("fingerprint", pre=True, always=True)
     def assign_fingerprint_if_none(cls, fingerprint, values):
         return get_fingerprint(fingerprint, values)
+
+    @validator("work_item_key", pre=True, always=True)
+    def validate_work_item_key(cls, work_item_key):
+        return normalize_work_item_key(work_item_key)
 
     @validator("deleted", pre=True, always=True)
     def validate_deleted(cls, deleted, values):
@@ -404,6 +464,7 @@ class DeduplicationRuleDto(BaseModel):
     full_deduplication: bool
     ignore_fields: list[str]
     is_provisioned: bool
+    rule_type: DeduplicationRuleType = DeduplicationRuleType.SPLIT
 
 
 class DeduplicationRuleRequestDto(BaseModel):
@@ -414,6 +475,7 @@ class DeduplicationRuleRequestDto(BaseModel):
     fingerprint_fields: list[str]
     full_deduplication: bool = False
     ignore_fields: Optional[list[str]] = None
+    rule_type: DeduplicationRuleType = DeduplicationRuleType.SPLIT
 
 
 class EnrichIncidentRequestBody(BaseModel):

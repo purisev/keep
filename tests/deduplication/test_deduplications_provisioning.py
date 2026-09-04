@@ -5,6 +5,7 @@ from keep.api.alert_deduplicator.deduplication_rules_provisioning import (
     provision_deduplication_rules_from_env,
 )
 from unittest.mock import patch
+from keep.api.models.alert import DeduplicationRuleType
 from keep.api.models.db.alert import AlertDeduplicationRule
 from keep.api.models.provider import Provider
 
@@ -30,6 +31,11 @@ def setup(monkeypatch):
                     "description": "fake new deduplication rule description",
                     "fingerprint_fields": ["fingerprint"],
                     "full_deduplication": False,
+                },
+                "fake new correlation rule": {
+                    "description": "fake new correlation rule description",
+                    "fingerprint_fields": ["labels.dedup_key"],
+                    "rule_type": "correlate",
                 }
             }
         },
@@ -155,7 +161,7 @@ def test_provisioning_of_new_rule(setup):
     Test the provisioning of new deduplication rules from the environment.
     """
     provision_deduplication_rules_from_env(setup["fake_tenant_id"])
-    setup["mock_create"].assert_called_once_with(
+    setup["mock_create"].assert_any_call(
         tenant_id=setup["fake_tenant_id"],
         name="fake new deduplication rule",
         description="fake new deduplication rule description",
@@ -168,6 +174,29 @@ def test_provisioning_of_new_rule(setup):
         ignore_fields=[],
         priority=0,
         is_provisioned=True,
+        rule_type=DeduplicationRuleType.SPLIT,
+    )
+
+
+def test_provisioning_of_new_correlation_rule(setup):
+    """
+    Test that a rule_type declared in the environment reaches the database.
+    """
+    provision_deduplication_rules_from_env(setup["fake_tenant_id"])
+    setup["mock_create"].assert_any_call(
+        tenant_id=setup["fake_tenant_id"],
+        name="fake new correlation rule",
+        description="fake new correlation rule description",
+        provider_id="a1b2c3d4e5f64789ab1234567890abcd",
+        provider_type="grafana",
+        created_by="system",
+        enabled=True,
+        fingerprint_fields=["labels.dedup_key"],
+        full_deduplication=False,
+        ignore_fields=[],
+        priority=0,
+        is_provisioned=True,
+        rule_type="correlate",
     )
 
 
@@ -189,6 +218,7 @@ def test_provisioning_of_existing_rule(setup):
         full_deduplication=True,
         ignore_fields=["ignore_field"],
         priority=0,
+        rule_type=DeduplicationRuleType.SPLIT,
     )
 
 

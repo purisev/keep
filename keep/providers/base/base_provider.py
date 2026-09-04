@@ -23,14 +23,21 @@ from dateutil.parser import parse
 
 from keep.api.bl.enrichments_bl import EnrichmentsBl
 from keep.api.core.db import (
-    get_custom_deduplication_rule,
+    get_deduplication_rules_by_type,
     get_enrichments,
     get_provider_by_name,
     is_linked_provider,
 )
 from keep.api.logging import ProviderLoggerAdapter
 from keep.api.models.action_type import ActionType
-from keep.api.models.alert import AlertDto, AlertSeverity, AlertStatus
+from keep.api.models.alert import (
+    AlertDto,
+    AlertSeverity,
+    AlertStatus,
+    DeduplicationRuleType,
+    normalize_work_item_key,
+)
+from keep.api.models.db.alert import AlertDeduplicationRule
 from keep.api.models.db.topology import TopologyServiceInDto
 from keep.api.models.incident import IncidentDto
 from keep.api.utils.enrichment_helpers import parse_and_enrich_deleted_and_assignees
@@ -471,10 +478,13 @@ class BaseProvider(metaclass=abc.ABCMeta):
         logger.debug("Alert formatted")
         # after the provider calculated the default fingerprint
         #   check if there is a custom deduplication rule and apply
-        custom_deduplication_rule = get_custom_deduplication_rule(
+        deduplication_rules = get_deduplication_rules_by_type(
             tenant_id=tenant_id,
             provider_id=provider_id,
             provider_type=provider_type,
+        )
+        custom_deduplication_rule = deduplication_rules.get(
+            DeduplicationRuleType.SPLIT.value
         )
 
         if not isinstance(formatted_alert, list):
@@ -487,24 +497,57 @@ class BaseProvider(metaclass=abc.ABCMeta):
                 alert.providerId = provider_id
                 alert.providerType = provider_type
 
-        # if there is no custom deduplication rule, return the formatted alert
-        if not custom_deduplication_rule:
-            return formatted_alert
-        # if there is a custom deduplication rule, apply it
-        # apply the custom deduplication rule to calculate the fingerprint
-        for alert in formatted_alert:
+        # a "split" rule sets the fingerprint
+        if custom_deduplication_rule:
+            for alert in formatted_alert:
+                logger.info(
+                    "Applying custom deduplication rule",
+                    extra={
+                        "tenant_id": tenant_id,
+                        "provider_id": provider_id,
+                        "alert_id": alert.id,
+                    },
+                )
+                alert.fingerprint = cls.get_alert_fingerprint(
+                    alert, custom_deduplication_rule.fingerprint_fields
+                )
+
+        # a "correlate" rule sets the work item key, and takes precedence over
+        # the key the provider derived from the payload
+        cls._apply_correlation_rule(
+            formatted_alert,
+            deduplication_rules.get(DeduplicationRuleType.CORRELATE.value),
+        )
+        return formatted_alert
+
+    @classmethod
+    def _apply_correlation_rule(
+        cls,
+        alerts: list[AlertDto],
+        correlation_rule: "AlertDeduplicationRule | None",
+    ) -> None:
+        """Set the work item key of every alert from the correlate rule."""
+        if not alerts or not correlation_rule:
+            return
+
+        logger = logging.getLogger(__name__)
+        for alert in alerts:
+            work_item_key = cls.get_work_item_key(
+                alert, correlation_rule.fingerprint_fields
+            )
+            if work_item_key is None:
+                # the alert carries none of the fields the rule groups on, so
+                # the key the provider derived stands
+                continue
             logger.info(
-                "Applying custom deduplication rule",
+                "Applying correlate deduplication rule",
                 extra={
-                    "tenant_id": tenant_id,
-                    "provider_id": provider_id,
                     "alert_id": alert.id,
+                    "work_item_key": work_item_key,
                 },
             )
-            alert.fingerprint = cls.get_alert_fingerprint(
-                alert, custom_deduplication_rule.fingerprint_fields
-            )
-        return formatted_alert
+            # assignment skips the field validator, so the key is normalized here
+            alert.work_item_key = normalize_work_item_key(work_item_key)
 
     @staticmethod
     def get_alert_fingerprint(alert: AlertDto, fingerprint_fields: list = []) -> str:
@@ -523,19 +566,56 @@ class BaseProvider(metaclass=abc.ABCMeta):
         fingerprint = hashlib.sha256()
         event_dict = alert.dict()
         for fingerprint_field in fingerprint_fields:
-            keys = fingerprint_field.split(".")
-            fingerprint_field_value = event_dict
-            for key in keys:
-                if isinstance(fingerprint_field_value, dict):
-                    fingerprint_field_value = fingerprint_field_value.get(key, None)
-                else:
-                    fingerprint_field_value = None
-                    break
-            if isinstance(fingerprint_field_value, (list, dict)):
-                fingerprint_field_value = json.dumps(fingerprint_field_value)
+            fingerprint_field_value = BaseProvider._extract_alert_field(
+                event_dict, fingerprint_field
+            )
             if fingerprint_field_value is not None:
                 fingerprint.update(str(fingerprint_field_value).encode())
         return fingerprint.hexdigest()
+
+    @staticmethod
+    def _extract_alert_field(event_dict: dict, field: str):
+        """Read a dotted path out of an alert dict, or None if it is not there."""
+        value = event_dict
+        for key in field.split("."):
+            if isinstance(value, dict):
+                value = value.get(key, None)
+            else:
+                return None
+        if isinstance(value, (list, dict)):
+            return json.dumps(value)
+        return value
+
+    @staticmethod
+    def get_work_item_key(alert: AlertDto, fingerprint_fields: list = []) -> str | None:
+        """Compute the work item key of an alert from a correlate rule's fields.
+
+        A single field is passed through verbatim, so the key stays matchable
+        against the tool that produced it. Several fields are hashed, since
+        their concatenation means nothing outside Keep.
+
+        Returns None when the alert carries none of the fields, which lets the
+        caller tell "the rule does not apply" from "the key is X".
+        """
+        if not fingerprint_fields:
+            return None
+
+        event_dict = alert.dict()
+        values = [
+            BaseProvider._extract_alert_field(event_dict, field)
+            for field in fingerprint_fields
+        ]
+        if all(value is None for value in values):
+            return None
+
+        if len(fingerprint_fields) == 1:
+            return str(values[0])
+
+        digest = hashlib.sha256()
+        for value in values:
+            if value is not None:
+                digest.update(str(value).encode())
+        return digest.hexdigest()
 
     def get_alerts_configuration(self, alert_id: Optional[str] = None):
         """
@@ -576,16 +656,23 @@ class BaseProvider(metaclass=abc.ABCMeta):
 
             # Apply custom deduplication rules to pulled alerts
             # (mirrors the logic in format_alert() for webhook alerts)
-            custom_deduplication_rule = get_custom_deduplication_rule(
+            deduplication_rules = get_deduplication_rules_by_type(
                 tenant_id=self.context_manager.tenant_id,
                 provider_id=self.provider_id,
                 provider_type=self.provider_type,
+            )
+            custom_deduplication_rule = deduplication_rules.get(
+                DeduplicationRuleType.SPLIT.value
             )
             if custom_deduplication_rule:
                 for alert in alerts:
                     alert.fingerprint = self.get_alert_fingerprint(
                         alert, custom_deduplication_rule.fingerprint_fields
                     )
+
+            self._apply_correlation_rule(
+                alerts, deduplication_rules.get(DeduplicationRuleType.CORRELATE.value)
+            )
 
             return alerts
 

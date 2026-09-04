@@ -62,7 +62,7 @@ from keep.api.models.ai_external import (
     ExternalAIConfigAndMetadata,
     ExternalAIConfigAndMetadataDto,
 )
-from keep.api.models.alert import AlertStatus
+from keep.api.models.alert import AlertStatus, DeduplicationRuleType
 from keep.api.models.db.action import Action
 from keep.api.models.db.ai_external import *  # pylint: disable=unused-wildcard-import
 from keep.api.models.db.alert import *  # pylint: disable=unused-wildcard-import
@@ -2583,15 +2583,48 @@ def get_deduplication_rule_by_id(tenant_id, rule_id: str):
     return rules
 
 
-def get_custom_deduplication_rule(tenant_id, provider_id, provider_type):
+def get_deduplication_rules_by_type(
+    tenant_id, provider_id, provider_type
+) -> dict[str, AlertDeduplicationRule]:
+    """Both of a provider's rules, keyed by type, in one query.
+
+    Ingestion needs the split rule and the correlate rule for every batch, so
+    they are read together.
+    """
     with Session(engine) as session:
-        rule = session.exec(
+        rules = session.exec(
             select(AlertDeduplicationRule)
             .where(AlertDeduplicationRule.tenant_id == tenant_id)
             .where(AlertDeduplicationRule.provider_id == provider_id)
             .where(AlertDeduplicationRule.provider_type == provider_type)
-        ).first()
-    return rule
+        ).all()
+    return {rule.rule_type: rule for rule in rules}
+
+
+def get_deduplication_rule_by_type(
+    tenant_id, provider_id, provider_type, rule_type: DeduplicationRuleType
+):
+    return get_deduplication_rules_by_type(
+        tenant_id, provider_id, provider_type
+    ).get(DeduplicationRuleType(rule_type).value)
+
+
+def get_custom_deduplication_rule(tenant_id, provider_id, provider_type):
+    """The rule that computes the alert fingerprint, if the tenant configured one."""
+    return get_deduplication_rule_by_type(
+        tenant_id, provider_id, provider_type, DeduplicationRuleType.SPLIT
+    )
+
+
+def get_correlation_deduplication_rule(tenant_id, provider_id, provider_type):
+    """The rule that computes the work item key, if the tenant configured one.
+
+    A provider can have this one and a split rule at the same time; they answer
+    different questions.
+    """
+    return get_deduplication_rule_by_type(
+        tenant_id, provider_id, provider_type, DeduplicationRuleType.CORRELATE
+    )
 
 
 def create_deduplication_rule(
@@ -2607,6 +2640,7 @@ def create_deduplication_rule(
     ignore_fields: list[str] = [],
     priority: int = 0,
     is_provisioned: bool = False,
+    rule_type: DeduplicationRuleType = DeduplicationRuleType.SPLIT,
 ):
     with Session(engine) as session:
         new_rule = AlertDeduplicationRule(
@@ -2623,6 +2657,7 @@ def create_deduplication_rule(
             ignore_fields=ignore_fields,
             priority=priority,
             is_provisioned=is_provisioned,
+            rule_type=DeduplicationRuleType(rule_type).value,
         )
         session.add(new_rule)
         session.commit()
@@ -2643,6 +2678,7 @@ def update_deduplication_rule(
     full_deduplication: bool = False,
     ignore_fields: list[str] = [],
     priority: int = 0,
+    rule_type: DeduplicationRuleType = DeduplicationRuleType.SPLIT,
 ):
     rule_uuid = __convert_to_uuid(rule_id)
     if not rule_uuid:
@@ -2667,6 +2703,7 @@ def update_deduplication_rule(
         rule.full_deduplication = full_deduplication
         rule.ignore_fields = ignore_fields
         rule.priority = priority
+        rule.rule_type = DeduplicationRuleType(rule_type).value
 
         session.add(rule)
         session.commit()
@@ -5713,6 +5750,60 @@ def get_last_alert_by_fingerprint(
         return session.exec(query).first()
 
 
+def get_last_alerts_by_work_item_key(
+    tenant_id: str,
+    work_item_key: str,
+    session: Optional[Session] = None,
+) -> list[LastAlert]:
+    """Every alert that currently belongs to the given work item."""
+    with existed_or_new_session(session) as session:
+        return session.exec(
+            select(LastAlert)
+            .where(
+                and_(
+                    LastAlert.tenant_id == tenant_id,
+                    LastAlert.work_item_key == work_item_key,
+                )
+            )
+            .order_by(LastAlert.first_timestamp)
+        ).all()
+
+
+def update_last_alert_work_item_keys(
+    tenant_id: str,
+    work_item_key_by_fingerprint: dict[str, str | None],
+    session: Optional[Session] = None,
+) -> int:
+    """Move already-stored alerts to the work item their latest occurrence names.
+
+    A deduplicated occurrence never becomes its own Alert row, but it can carry
+    a different grouping when the source regroups or a correlate rule changes.
+    Only rows whose key differs are touched, in one query per batch.
+    """
+    if not work_item_key_by_fingerprint:
+        return 0
+
+    updated = 0
+    caller_owns_session = session is not None
+    with existed_or_new_session(session) as session:
+        last_alerts = session.exec(
+            select(LastAlert)
+            .where(LastAlert.tenant_id == tenant_id)
+            .where(LastAlert.fingerprint.in_(work_item_key_by_fingerprint.keys()))
+        ).all()
+        for last_alert in last_alerts:
+            work_item_key = work_item_key_by_fingerprint[last_alert.fingerprint]
+            if last_alert.work_item_key == work_item_key:
+                continue
+            last_alert.work_item_key = work_item_key
+            session.add(last_alert)
+            updated += 1
+        # a caller's transaction is its own to commit
+        if updated and not caller_owns_session:
+            session.commit()
+    return updated
+
+
 def set_last_alert(
     tenant_id: str, alert: Alert, session: Optional[Session] = None, max_retries=3
 ) -> None:
@@ -5751,6 +5842,9 @@ def set_last_alert(
                     last_alert.timestamp = alert.timestamp
                     last_alert.alert_id = alert.id
                     last_alert.alert_hash = alert.alert_hash
+                    last_alert.work_item_key = (alert.event or {}).get(
+                        "work_item_key"
+                    )
                     session.add(last_alert)
 
                 elif not last_alert:
@@ -5762,6 +5856,7 @@ def set_last_alert(
                         first_timestamp=alert.timestamp,
                         alert_id=alert.id,
                         alert_hash=alert.alert_hash,
+                        work_item_key=(alert.event or {}).get("work_item_key"),
                     )
 
                 session.add(last_alert)

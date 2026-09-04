@@ -4,6 +4,7 @@ import re
 
 import keep.api.core.db as db
 from keep.api.core.config import config
+from keep.api.models.alert import DeduplicationRuleType
 from keep.providers.providers_factory import ProvidersFactory
 
 logger = logging.getLogger(__name__)
@@ -71,6 +72,9 @@ def provision_deduplication_rules(deduplication_rules: dict[str, any], tenant_id
                 ignore_fields=deduplication_rule_to_provision.get("ignore_fields")
                 or [],
                 priority=0,
+                rule_type=deduplication_rule_to_provision.get(
+                    "rule_type", DeduplicationRuleType.SPLIT
+                ),
             )
             continue
 
@@ -95,6 +99,9 @@ def provision_deduplication_rules(deduplication_rules: dict[str, any], tenant_id
             ignore_fields=deduplication_rule_to_provision.get("ignore_fields") or [],
             priority=0,
             is_provisioned=True,
+            rule_type=deduplication_rule_to_provision.get(
+                "rule_type", DeduplicationRuleType.SPLIT
+            ),
         )
 
 

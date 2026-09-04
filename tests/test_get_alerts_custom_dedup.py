@@ -42,7 +42,7 @@ def _make_provider(alerts):
 
 
 class TestGetAlertsCustomDedup(unittest.TestCase):
-    @patch("keep.providers.base.base_provider.get_custom_deduplication_rule")
+    @patch("keep.providers.base.base_provider.get_deduplication_rules_by_type")
     def test_custom_dedup_rule_overwrites_fingerprint(self, mock_get_rule):
         """Pulled alerts should get fingerprints recalculated when a custom dedup rule exists."""
         alert_a = _make_alert(
@@ -58,7 +58,7 @@ class TestGetAlertsCustomDedup(unittest.TestCase):
 
         rule = MagicMock()
         rule.fingerprint_fields = ["labels.alertname", "labels.env"]
-        mock_get_rule.return_value = rule
+        mock_get_rule.return_value = {"split": rule}
 
         provider = _make_provider([alert_a, alert_b])
 
@@ -83,7 +83,7 @@ class TestGetAlertsCustomDedup(unittest.TestCase):
         expected_b.update(b"staging")
         self.assertEqual(alerts[1].fingerprint, expected_b.hexdigest())
 
-    @patch("keep.providers.base.base_provider.get_custom_deduplication_rule")
+    @patch("keep.providers.base.base_provider.get_deduplication_rules_by_type")
     def test_no_custom_rule_keeps_original_fingerprint(self, mock_get_rule):
         """Without a custom dedup rule, pulled alerts keep their original fingerprint."""
         alert = _make_alert(
@@ -92,7 +92,7 @@ class TestGetAlertsCustomDedup(unittest.TestCase):
             fingerprint="original-fp",
         )
 
-        mock_get_rule.return_value = None
+        mock_get_rule.return_value = {}
 
         provider = _make_provider([alert])
 
@@ -105,7 +105,7 @@ class TestGetAlertsCustomDedup(unittest.TestCase):
 
         self.assertEqual(alerts[0].fingerprint, "original-fp")
 
-    @patch("keep.providers.base.base_provider.get_custom_deduplication_rule")
+    @patch("keep.providers.base.base_provider.get_deduplication_rules_by_type")
     def test_custom_dedup_with_dot_notation_fields(self, mock_get_rule):
         """Custom dedup should support dot-notation to access nested dict fields."""
         alert = _make_alert(
@@ -119,7 +119,7 @@ class TestGetAlertsCustomDedup(unittest.TestCase):
             "labels.env_dc",
             "labels.group",
         ]
-        mock_get_rule.return_value = rule
+        mock_get_rule.return_value = {"split": rule}
 
         provider = _make_provider([alert])
 

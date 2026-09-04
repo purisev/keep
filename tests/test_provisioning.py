@@ -5,7 +5,7 @@ import json
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import text
+from sqlalchemy import event, text
 
 from tests.fixtures.client import client, setup_api_key, test_app  # noqa
 
@@ -380,32 +380,46 @@ def test_provision_provider_with_empty_tenant_table(db_session, client, test_app
     db_session.execute(text("DELETE FROM tenant"))
     db_session.commit()
 
-    # Enable SQLite foreign keys
-    db_session.execute(text("PRAGMA foreign_keys = ON;"))
-    result = db_session.execute(text("PRAGMA foreign_keys;")).fetchone()
-    assert result is not None and result[0] == 1, "Foreign keys not enabled"
-
     # Verify tenant table is empty
     tenant_count = db_session.execute(text("SELECT COUNT(*) FROM tenant")).fetchone()[0]
     assert tenant_count == 0, "Tenant table should be empty"
 
     # Import ProvidersService
+    from keep.api.core.db import engine
     from keep.api.core.dependencies import SINGLE_TENANT_UUID
     from keep.providers.providers_service import ProvidersService
 
-    # Call install_provider directly instead of provision_providers_from_env
-    # This bypasses the exception handling in provision_providers_from_env
-    with pytest.raises(Exception) as excinfo:
-        ProvidersService.install_provider(
-            tenant_id=SINGLE_TENANT_UUID,
-            installed_by="system",
-            provider_id="victoriametrics123",
-            provider_name="keepVictoriaMetrics123",
-            provider_type="victoriametrics",
-            provider_config={"VMAlertHost": "http://localhost", "VMAlertPort": 1234},
-            provisioned=True,
-            validate_scopes=False,
-        )
+    # sqlite enforces foreign keys per connection and install_provider writes on
+    # its own, so the pragma goes on every connection the engine hands out
+    def enable_foreign_keys(dbapi_connection, connection_record):
+        dbapi_connection.execute("PRAGMA foreign_keys=ON")
+
+    sqlite = engine.dialect.name == "sqlite"
+    if sqlite:
+        event.listen(engine, "connect", enable_foreign_keys)
+        engine.dispose()
+
+    try:
+        # Call install_provider directly instead of provision_providers_from_env
+        # This bypasses the exception handling in provision_providers_from_env
+        with pytest.raises(Exception) as excinfo:
+            ProvidersService.install_provider(
+                tenant_id=SINGLE_TENANT_UUID,
+                installed_by="system",
+                provider_id="victoriametrics123",
+                provider_name="keepVictoriaMetrics123",
+                provider_type="victoriametrics",
+                provider_config={
+                    "VMAlertHost": "http://localhost",
+                    "VMAlertPort": 1234,
+                },
+                provisioned=True,
+                validate_scopes=False,
+            )
+    finally:
+        if sqlite:
+            event.remove(engine, "connect", enable_foreign_keys)
+            engine.dispose()
 
     # Verify that the error message is related to foreign key constraint violation
     error_msg = str(excinfo.value).lower()
@@ -414,5 +428,3 @@ def test_provision_provider_with_empty_tenant_table(db_session, client, test_app
         or "FOREIGN KEY constraint failed" in str(excinfo.value)
         or "violates foreign key constraint" in error_msg
     )
-
-    db_session.execute(text("PRAGMA foreign_keys = OFF;"))

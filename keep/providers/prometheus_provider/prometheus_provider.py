@@ -11,7 +11,12 @@ import pydantic
 import requests
 from requests.auth import HTTPBasicAuth
 
-from keep.api.models.alert import AlertDto, AlertSeverity, AlertStatus
+from keep.api.models.alert import (
+    AlertDto,
+    AlertGroupDto,
+    AlertSeverity,
+    AlertStatus,
+)
 from keep.contextmanager.contextmanager import ContextManager
 from keep.providers.base.base_provider import BaseProvider, ProviderHealthMixin
 from keep.providers.models.provider_config import ProviderConfig, ProviderScope
@@ -168,16 +173,108 @@ receivers:
         alert_dtos = self._format_alert(alerts_data)
         return alert_dtos
 
+    # Label/annotation names that name the work item explicitly. Looked up
+    # case-insensitively, alert level first, then group level.
+    DEDUP_KEY_FIELDS = ("dedup_key", "dedupkey")
+
+    @staticmethod
+    def _lookup_ci(mapping: dict, keys: tuple) -> str | None:
+        """First present key out of `keys`, matched without regard to case."""
+        if not isinstance(mapping, dict):
+            return None
+        lowered = {
+            str(k).lower(): v for k, v in mapping.items() if v not in (None, "")
+        }
+        for key in keys:
+            if key in lowered:
+                return str(lowered[key])
+        return None
+
+    @staticmethod
+    def _extract_alert_group(event: dict) -> AlertGroupDto | None:
+        """Read the grouping envelope out of an Alertmanager webhook body.
+
+        Alertmanager decides what belongs together - `group_by`, `group_wait`,
+        `group_interval` - and sends one request per group.
+
+        Returns None for payloads that carry no grouping: a single alert pulled
+        from /api/v1/alerts, or a bare {"alerts": [...]} body.
+        """
+        if not isinstance(event, dict) or not isinstance(event.get("alerts"), list):
+            return None
+
+        group = AlertGroupDto(
+            key=event.get("groupKey"),
+            labels=event.get("groupLabels") or {},
+            common_labels=event.get("commonLabels") or {},
+            common_annotations=event.get("commonAnnotations") or {},
+            receiver=event.get("receiver"),
+            external_url=event.get("externalURL"),
+            size=len(event["alerts"]),
+            truncated=event.get("truncatedAlerts") or 0,
+        )
+        # a body with none of the group-level fields is just a list of alerts
+        if not any(
+            [
+                group.key,
+                group.labels,
+                group.common_labels,
+                group.common_annotations,
+                group.receiver,
+            ]
+        ):
+            return None
+        return group
+
+    @classmethod
+    def _resolve_work_item_key(
+        cls,
+        event: dict,
+        labels: dict,
+        annotations: dict,
+        group: AlertGroupDto | None,
+    ) -> str | None:
+        """Which unit of work this alert belongs to, verbatim.
+
+        An explicit dedup_key takes precedence over Alertmanager's groupKey: it
+        is the identifier that also exists in the tool that sent it, while a
+        groupKey is only meaningful next to the Alertmanager that generated it.
+        Both are used as-is, never hashed.
+        """
+        for mapping in (labels, annotations):
+            dedup_key = cls._lookup_ci(mapping, cls.DEDUP_KEY_FIELDS)
+            if dedup_key:
+                return dedup_key
+
+        if group:
+            for mapping in (
+                group.common_labels,
+                group.common_annotations,
+                group.labels,
+            ):
+                dedup_key = cls._lookup_ci(mapping, cls.DEDUP_KEY_FIELDS)
+                if dedup_key:
+                    return dedup_key
+
+        dedup_key = cls._lookup_ci(event, cls.DEDUP_KEY_FIELDS)
+        if dedup_key:
+            return dedup_key
+
+        return group.key if group else None
+
     @staticmethod
     def _format_alert(
         event: dict, provider_instance: "BaseProvider" = None
     ) -> list[AlertDto]:
-        # TODO: need to support more than 1 alert per event
         alert_dtos = []
         if isinstance(event, list):
             return event
         else:
             alerts = event.get("alerts", [event])
+
+        # the group is a property of the notification, not of any one alert in
+        # it, so it is read once and attached to each member below
+        group = PrometheusProvider._extract_alert_group(event)
 
         for alert in alerts:
             raw_id = alert.get("id")
@@ -205,6 +302,9 @@ receivers:
             severity = PrometheusProvider.SEVERITIES_MAP.get(
                 labels.get("severity"), AlertSeverity.INFO
             )
+            work_item_key = PrometheusProvider._resolve_work_item_key(
+                event, labels, annotations, group
+            )
             alert_dto = AlertDto(
                 id=alert_id,
                 name=alert_id,
@@ -221,6 +321,8 @@ receivers:
                 annotations=annotations,  # annotations can be used either by alert.annotations.some_annotation or by alert.some_annotation
                 payload=alert,
                 fingerprint=alert.pop("fingerprint", None),
+                work_item_key=work_item_key,
+                alert_group=group,
                 **alert,  # rest of the fields
             )
             for label in labels:

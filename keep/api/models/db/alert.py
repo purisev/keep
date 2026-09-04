@@ -9,6 +9,7 @@ from sqlalchemy_utils import UUIDType
 from sqlmodel import JSON, TEXT, Column, Field, Index, Relationship, SQLModel
 
 from keep.api.core.config import config
+from keep.api.models.alert import DeduplicationRuleType
 from keep.api.models.db.helpers import DATETIME_COLUMN_TYPE, NULL_FOR_DELETED_AT
 from keep.api.models.db.incident import Incident
 from keep.api.models.db.tenant import Tenant
@@ -48,6 +49,10 @@ class LastAlert(SQLModel, table=True):
     timestamp: datetime = Field(nullable=False, index=True)
     first_timestamp: datetime = Field(nullable=False, index=True)
     alert_hash: str | None = Field(nullable=True, index=True)
+    # Which unit of work this alert belongs to. Shared by every alert of one
+    # Alertmanager group / dedup_key, while the fingerprint above stays unique
+    # per alert. Null when the source sends no grouping.
+    work_item_key: str | None = Field(default=None, nullable=True)
 
     __table_args__ = (
         # Original indexes from MySQL
@@ -59,6 +64,12 @@ class LastAlert(SQLModel, table=True):
             "first_timestamp",
             "alert_id",
             "fingerprint",
+        ),
+        # membership of a work item is a lookup by value on this column
+        Index(
+            "idx_lastalert_tenant_work_item_key",
+            "tenant_id",
+            "work_item_key",
         ),
         {},
     )
@@ -219,6 +230,8 @@ class AlertDeduplicationRule(SQLModel, table=True):
     ignore_fields: list[str] = Field(sa_column=Column(JSON), default=[])
     priority: int = Field(default=0)  # for future use
     is_provisioned: bool = Field(default=False)
+    # "split" computes the alert fingerprint, "correlate" the work item key
+    rule_type: str = Field(default=DeduplicationRuleType.SPLIT.value)
 
     class Config:
         arbitrary_types_allowed = True
