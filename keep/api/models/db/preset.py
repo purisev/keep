@@ -47,7 +47,11 @@ class Preset(SQLModel, table=True):
     is_private: Optional[bool] = Field(default=False)
     is_noisy: Optional[bool] = Field(default=False)
     counter_shows_firing_only: Optional[bool] = Field(default=False)
-    name: str = Field(unique=True)
+    # Uniqueness is per tenant via the composite UniqueConstraint in
+    # __table_args__. A standalone unique index on name alone would make preset
+    # names global across tenants, so two tenants could not both have e.g. a
+    # "Test preset" - see migration preset_name_unique_per_tenant.
+    name: str = Field(nullable=False)
     options: list = Field(sa_column=Column(JSON))  # [{"label": "", "value": ""}]
     # Provisioning fields, mirroring MappingRule.is_provisioned / provisioned_file.
     # Reconciliation only ever deletes rows with is_provisioned=True, so a preset

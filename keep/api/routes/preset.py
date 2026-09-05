@@ -12,6 +12,7 @@ from fastapi import (
     Response,
 )
 from pydantic import BaseModel
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from keep.api.consts import PROVIDER_PULL_INTERVAL_MINUTE, STATIC_PRESETS
@@ -303,7 +304,15 @@ def create_preset(
 
     # Add preset and commit to generate preset ID
     session.add(preset)
-    session.commit()
+    try:
+        session.commit()
+    except IntegrityError:
+        # A preset with this name already exists for the tenant (composite unique
+        # tenant_id+name). Return a clean 409 instead of leaking a 500.
+        session.rollback()
+        raise HTTPException(
+            409, f"A preset named '{body.name}' already exists"
+        )
     session.refresh(preset)
 
     # Explicitly create PresetTagLink entries
