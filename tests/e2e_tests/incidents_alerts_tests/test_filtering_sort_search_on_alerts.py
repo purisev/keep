@@ -69,6 +69,23 @@ def init_test(browser: Page, alerts, max_retries=3):
     browser.get_by_role("main").locator("[data-testid='facet-value']").first.wait_for(
         timeout=30000
     )
+    # The alerts table renders skeleton placeholder rows until the client-side
+    # query pipeline assembles and its POST /alerts/query resolves. On a cold or
+    # CPU-constrained stack (e.g. e2e running with -n 4) that first render can take
+    # well over 10s, and there is no push channel to nudge it, so wait for the
+    # skeleton to detach rather than for a text match against the first alert name
+    # (which cannot tell "still loading" from "wrong data").
+    browser.wait_for_function(
+        """() => {
+            const table = document.querySelector("[data-testid='alerts-table']");
+            if (!table) return false;
+            const rows = table.querySelectorAll('table tbody tr');
+            if (rows.length === 0) return false;
+            // skeleton cells carry the animate-pulse class; real rows do not
+            return table.querySelectorAll('.animate-pulse').length === 0;
+        }""",
+        timeout=60000,
+    )
     browser.wait_for_selector(f"text={alerts[0]['name']}", timeout=10000)
     rows_count = browser.locator("[data-testid='alerts-table'] table tbody tr").count()
     # check that required alerts are loaded and displayed
